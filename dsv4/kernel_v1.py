@@ -53,27 +53,50 @@ Numerics (kernel_refs.md §I)
     the first iteration when an entire chunk is masked. ``p`` is also
     explicitly masked to zero so the denominator stays exact.
 
-What v1 does NOT do (TODO for v2+)
-----------------------------------
+Backward (kernel_refs §D3)
+--------------------------
+
+v1 ships a hand-written Pallas backward for the FlashAttention-with-sink
+core. The forward kernel writes one extra HBM output, ``lse`` (the
+combined log-sum-exp including the sink term), shape ``[B, n, n_h, 1]``
+fp32. With that saved residual, the bwd kernel recomputes ``p`` from
+``q · k^T`` and ``lse``, then accumulates:
+
+  - ``dq`` across the k-step axis (per-program VMEM scratch, finalized at
+    the last step) — same accumulation pattern as the forward acc.
+  - ``dk`` per-tile (QK contribution + PV contribution; V == K under V4).
+  - ``dsink`` is closed-form in JAX outside the kernel:
+    ``dsink_h = -∑_(b,t) exp(sink_h - lse_{b,t,h}) · (dout · o)_{b,t,h}``.
+
+The custom_vjp boundary is wrapped around just the Pallas call (not the
+whole ``sparse_attn_kernel_v1`` surface). The gather/concat preamble
+that builds ``K_full`` from ``K_comp`` and ``topk_idxs`` is plain JAX
+and gets its bwd from natural autodiff — that's what produces dK_comp /
+dK_swa from dK_full, including the scatter-add over duplicate top-k
+selections.
+
+What v1 still does NOT do (TODO for v2+)
+----------------------------------------
 
   - Scalar-prefetched gather inside the kernel (kernel_refs §D4). Today the
     gather of ``K_comp[topk_idxs]`` materializes ``K_full[B, n, S, c]``
     via ``jnp.take_along_axis``, which is identical to the reference's
-    bandwidth profile. v2 should pass ``topk_idxs`` through
+    bandwidth profile. v2+ should pass ``topk_idxs`` through
     ``pltpu.PrefetchScalarGridSpec`` and gather inside.
-  - Hand-written backward with saved (m, l) residuals (kernel_refs §D3).
-    v1 uses ``jax.vjp`` through the reference forward.
+  - Per-program deterministic KV-grad scratch (paper §3.3). The current
+    bwd writes ``dk`` per-tile, which is already deterministic on TPU
+    because no two programs share the same (b, qi, si) slot. The §3.3
+    pattern (per-SM accumulation buffer + global deterministic sum) only
+    matters once we tile the same K entry across multiple programs —
+    e.g., a streaming bwd over very long S.
   - Megacore-aware pipelining for the inner K-loop. We mark the outer
     (B, q-tile) axes as ``"parallel"`` — that already lets the compiler
     split across cores on v5p/v6p. The k-step axis accumulates and stays
-    sequential. v2 should explore ``pltpu.emit_pipeline`` for inner
+    sequential. v2+ should explore ``pltpu.emit_pipeline`` for inner
     multi-buffering.
   - Autotuned block-size search. ``config_for`` picks the largest tiles
-    that fit the budget; v2 can layer a timing sweep on top, caching to
+    that fit the budget; v2+ can layer a timing sweep on top, caching to
     disk keyed by ``(tpu, n_h, c, S)``.
-
-To enable in dsv4/kernel.py: replace the ``ref.sparse_attn_with_sink`` call
-in ``_sparse_attn_fwd`` with ``sparse_attn_kernel_v1`` from this module.
 """
 
 from __future__ import annotations
@@ -85,7 +108,6 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
-from . import reference as ref
 from .kernel_config import KernelConfig, default_config
 
 
@@ -104,6 +126,7 @@ def _flash_sink_kernel(
     mask_ref,        # [1, BQ, BS]       bool      — validity
     sink_ref,        # [n_h]             f32       — per-head sink logits
     o_ref,           # [1, BQ, n_h, c]   bf16/f32  — output (written on last step)
+    lse_ref,         # [1, BQ, n_h, 1]   f32       — combined log-sum-exp (written on last step)
     m_ref,           # [1, BQ, n_h, c]   f32 scratch — running max  (broadcast over c)
     l_ref,           # [1, BQ, n_h, c]   f32 scratch — running denom (broadcast over c)
     acc_ref,         # [1, BQ, n_h, c]   f32 scratch — running numerator
@@ -179,6 +202,12 @@ def _flash_sink_kernel(
         out = (acc_final * alpha_final) / denom
         o_ref[...] = out.astype(o_ref.dtype)
 
+        # lse = log-sum-exp over (valid logits ∪ sink), in the original logit
+        # frame. Saved for the bwd kernel — recovers p_s = exp(s - lse) and
+        # p_sink = exp(sink - lse) without re-running online softmax.
+        lse = m_combined + jnp.log(denom)
+        lse_ref[...] = lse.astype(jnp.float32)
+
 
 # ---------------------------------------------------------------------------
 # Pallas-call wrapper
@@ -191,7 +220,10 @@ def _flash_attn_with_sink_pallas(
     attn_sink: jax.Array, # [n_h]
     scale: float,
     config: KernelConfig,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
+    """Returns ``(out, lse)``. ``lse`` is the combined (sink-inclusive)
+    log-sum-exp per (b, t, h); saved as a residual for the bwd kernel.
+    """
     B, n, n_h, c = q.shape
     S = K_full.shape[2]
     bq, bs = config.bq, config.bs
@@ -215,13 +247,20 @@ def _flash_attn_with_sink_pallas(
     mask_spec = pl.BlockSpec((1, bq, bs),     lambda b, qi, si: (b, qi, si))
     sink_spec = pl.BlockSpec((n_h,),          lambda b, qi, si: (0,))
     o_spec    = pl.BlockSpec((1, bq, n_h, c), lambda b, qi, si: (b, qi, 0, 0))
+    # ``lse`` is per (b, t, h); the trailing-1 last dim is "natural" (matches
+    # the original array's last dim), which exempts it from the lane-multiple
+    # rule. The n_h dim likewise matches the original (sublane-rule exempt).
+    lse_spec  = pl.BlockSpec((1, bq, n_h, 1), lambda b, qi, si: (b, qi, 0, 0))
 
     return pl.pallas_call(
         partial(_flash_sink_kernel, nsteps=nsteps, scale=scale),
         grid=grid,
         in_specs=[q_spec, k_spec, mask_spec, sink_spec],
-        out_specs=o_spec,
-        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        out_specs=[o_spec, lse_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct(q.shape, q.dtype),
+            jax.ShapeDtypeStruct((B, n, n_h, 1), jnp.float32),
+        ],
         scratch_shapes=[
             pltpu.VMEM((1, bq, n_h, c), jnp.float32),  # m
             pltpu.VMEM((1, bq, n_h, c), jnp.float32),  # l
@@ -236,6 +275,164 @@ def _flash_attn_with_sink_pallas(
         ),
         interpret=config.interpret,
     )(q, K_full, mask, attn_sink)
+
+
+# ---------------------------------------------------------------------------
+# Pallas kernel: FlashAttention backward via saved (lse) residual
+# ---------------------------------------------------------------------------
+#
+# Given the forward's saved log-sum-exp ``lse`` (which already absorbs the
+# sink term) and the precomputed scalar ``D = Σ_c dout · o``, we recover the
+# attention weights inside the bwd as ``p_s = exp(s_s - lse) · mask`` and
+# apply the standard softmax-backprop identity ``dlogits_s = p_s · (dp_s - D)``
+# where ``dp_s = Σ_c dout · v_s`` (and v == k under V4). Because the sink has
+# value vector 0, it only shifts ``lse`` — it never appears in ``D`` or in
+# ``dp``, and the sink's own gradient is closed-form in JAX outside the kernel.
+#
+# Accumulation pattern, mirroring the forward:
+#   - ``dq`` accumulates across the k-step axis (per-program VMEM scratch),
+#     written to HBM at the last step.
+#   - ``dk`` (= dv under V4) is per-(b, qi, si) tile: QK contribution
+#     ``Σ_h scale · dlogits_s · q`` + PV contribution ``Σ_h p_s · dout``.
+# No two grid programs write to the same HBM (b, qi, si) slot, so dk is
+# deterministic without the per-SM-buffer pattern from paper §3.3.
+
+
+def _flash_sink_kernel_bwd(
+    q_ref,           # [1, BQ, n_h, c]   bf16/f32
+    k_ref,           # [1, BQ, BS, c]    bf16/f32   (k == v in V4)
+    mask_ref,        # [1, BQ, BS]       bool
+    lse_ref,         # [1, BQ, n_h, 1]   f32
+    D_ref,           # [1, BQ, n_h, 1]   f32        precomputed (Σ_c dout · o)
+    dout_ref,        # [1, BQ, n_h, c]   bf16/f32
+    dq_ref,          # [1, BQ, n_h, c]   bf16/f32   out (finalized at last step)
+    dk_ref,          # [1, BQ, BS, c]    bf16/f32   out (per-tile)
+    dq_scratch_ref,  # [1, BQ, n_h, c]   f32 scratch (running dq accumulator)
+    *,
+    nsteps: int,
+    scale: float,
+):
+    s = pl.program_id(2)
+
+    @pl.when(s == 0)
+    def _init_dq():
+        dq_scratch_ref[...] = jnp.zeros(dq_scratch_ref.shape, dtype=jnp.float32)
+
+    q = q_ref[...].astype(jnp.float32)        # [1, BQ, n_h, c]
+    k = k_ref[...].astype(jnp.float32)        # [1, BQ, BS, c]
+    mask = mask_ref[...].astype(jnp.bool_)    # [1, BQ, BS]
+    lse = lse_ref[...]                        # [1, BQ, n_h, 1]
+    D = D_ref[...]                            # [1, BQ, n_h, 1]
+    dout = dout_ref[...].astype(jnp.float32)  # [1, BQ, n_h, c]
+
+    # Recompute attention weights p from the saved lse.
+    logits = jax.lax.dot_general(
+        q, k,
+        dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1))),
+        preferred_element_type=jnp.float32,
+    ) * jnp.float32(scale)                                    # [1, BQ, n_h, BS]
+
+    mask_b = mask[:, :, None, :]                              # [1, BQ, 1, BS]
+    p = jnp.exp(logits - lse)                                 # [1, BQ, n_h, BS]
+    p = jnp.where(mask_b, p, jnp.float32(0.0))
+
+    # dp[b,t,h,s] = Σ_c dout[b,t,h,c] · k[b,t,s,c]    (same contraction as fwd QK^T)
+    dp = jax.lax.dot_general(
+        dout, k,
+        dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1))),
+        preferred_element_type=jnp.float32,
+    )                                                          # [1, BQ, n_h, BS]
+
+    # Standard softmax-bwd identity. Masked positions stay 0 because p is
+    # zeroed for them, which propagates through the multiply.
+    dlogits = p * (dp - D)                                     # [1, BQ, n_h, BS]
+
+    # dq contribution from this s-tile.
+    # dlogits: [..., n_h, BS] · k: [..., BS, c] → [..., n_h, c]
+    dq_contrib = jax.lax.dot_general(
+        dlogits, k,
+        dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))),
+        preferred_element_type=jnp.float32,
+    ) * jnp.float32(scale)                                     # [1, BQ, n_h, c]
+    dq_scratch_ref[...] = dq_scratch_ref[...] + dq_contrib
+
+    # dk per-tile, QK + PV. Both contract over n_h (dim 2 in both operands).
+    dk_qk = jax.lax.dot_general(
+        dlogits, q,
+        dimension_numbers=(((2,), (2,)), ((0, 1), (0, 1))),
+        preferred_element_type=jnp.float32,
+    ) * jnp.float32(scale)                                     # [1, BQ, BS, c]
+    dk_pv = jax.lax.dot_general(
+        p, dout,
+        dimension_numbers=(((2,), (2,)), ((0, 1), (0, 1))),
+        preferred_element_type=jnp.float32,
+    )                                                          # [1, BQ, BS, c]
+    dk_ref[...] = (dk_qk + dk_pv).astype(dk_ref.dtype)
+
+    @pl.when(s == nsteps - 1)
+    def _finalize_dq():
+        dq_ref[...] = dq_scratch_ref[...].astype(dq_ref.dtype)
+
+
+def _flash_attn_with_sink_pallas_bwd(
+    q: jax.Array,         # [B, n, n_h, c]   (padded to BQ)
+    K_full: jax.Array,    # [B, n, S, c]     (padded to BQ along n, BS along S)
+    mask: jax.Array,      # [B, n, S] bool
+    attn_sink: jax.Array, # [n_h]
+    out: jax.Array,       # [B, n, n_h, c]   forward output (padded)
+    lse: jax.Array,       # [B, n, n_h, 1] f32
+    dout: jax.Array,      # [B, n, n_h, c]   upstream cotangent (padded)
+    scale: float,
+    config: KernelConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Bwd kernel call. Returns ``(dq, dk, dsink)``.
+
+    ``dsink`` is computed entirely in JAX outside the Pallas grid because
+    the sink term only contributes through ``lse`` — its gradient is
+    ``dsink_h = -Σ_(b,t) exp(sink_h - lse_{b,t,h}) · D_{b,t,h}``.
+    """
+    B, n, n_h, c = q.shape
+    S = K_full.shape[2]
+    bq, bs = config.bq, config.bs
+    nsteps = S // bs
+
+    # Precompute D = Σ_c (dout · o). Shape [B, n, n_h, 1] f32, same layout
+    # as lse so it tiles into the kernel under the same BlockSpec.
+    D = (dout.astype(jnp.float32) * out.astype(jnp.float32)).sum(
+        axis=-1, keepdims=True,
+    )
+
+    grid = (B, n // bq, nsteps)
+    q_spec    = pl.BlockSpec((1, bq, n_h, c), lambda b, qi, si: (b, qi, 0, 0))
+    k_spec    = pl.BlockSpec((1, bq, bs, c),  lambda b, qi, si: (b, qi, si, 0))
+    mask_spec = pl.BlockSpec((1, bq, bs),     lambda b, qi, si: (b, qi, si))
+    lse_spec  = pl.BlockSpec((1, bq, n_h, 1), lambda b, qi, si: (b, qi, 0, 0))
+    d_spec    = pl.BlockSpec((1, bq, n_h, 1), lambda b, qi, si: (b, qi, 0, 0))
+    dout_spec = pl.BlockSpec((1, bq, n_h, c), lambda b, qi, si: (b, qi, 0, 0))
+    dq_spec   = pl.BlockSpec((1, bq, n_h, c), lambda b, qi, si: (b, qi, 0, 0))
+    dk_spec   = pl.BlockSpec((1, bq, bs, c),  lambda b, qi, si: (b, qi, si, 0))
+
+    dq, dk = pl.pallas_call(
+        partial(_flash_sink_kernel_bwd, nsteps=nsteps, scale=scale),
+        grid=grid,
+        in_specs=[q_spec, k_spec, mask_spec, lse_spec, d_spec, dout_spec],
+        out_specs=[dq_spec, dk_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct(q.shape, q.dtype),
+            jax.ShapeDtypeStruct(K_full.shape, K_full.dtype),
+        ],
+        scratch_shapes=[pltpu.VMEM((1, bq, n_h, c), jnp.float32)],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "arbitrary"),
+        ),
+        interpret=config.interpret,
+    )(q, K_full, mask, lse, D, dout)
+
+    # dsink, closed-form in JAX.
+    sink_b = attn_sink[None, None, :, None].astype(jnp.float32)  # [1, 1, n_h, 1]
+    p_sink = jnp.exp(sink_b - lse)                                # [B, n, n_h, 1]
+    dsink = (-p_sink * D).sum(axis=(0, 1, 3)).astype(attn_sink.dtype)
+    return dq, dk, dsink
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +463,61 @@ def _gather_concat_mask(q, K_comp, topk_idxs, K_swa):
     return K_full, mask
 
 
+# ---------------------------------------------------------------------------
+# Diffable Pallas boundary: forward + hand-written bwd, wrapped in custom_vjp
+# ---------------------------------------------------------------------------
+#
+# This is the narrow boundary the custom_vjp lives around: the Pallas forward
+# (which also emits ``lse``) and the Pallas backward (which consumes it).
+# Everything outside — the gather/concat that builds K_full from K_comp and
+# topk_idxs — stays in JAX, so natural autodiff handles it and produces
+# dK_comp / dK_swa (including the scatter-add over duplicate top-k entries).
+#
+# Why the float-mask cast: ``mask`` is a bool tensor. ``jax.custom_vjp`` is
+# strictest about cotangents matching primal dtypes, and bool primals do not
+# carry a meaningful float cotangent. We pass the mask through the boundary
+# as fp32 (cast once, ~negligible HBM cost), then re-binarize inside. The
+# bwd returns ``jnp.zeros_like(mask_f)`` for that slot.
+
+
+@lru_cache(maxsize=None)
+def _make_flash_diffable(config: KernelConfig, c: int):
+    """Cached ``custom_vjp`` closure for the Pallas flash core.
+
+    Cached on ``(config, c)`` so the scale and block sizes are constants in
+    the traced kernel (keeping the JIT cache hot across calls with the same
+    shapes).
+    """
+    scale = float(c) ** -0.5
+
+    @jax.custom_vjp
+    def _flash(q, K_full, mask_f, attn_sink):
+        mask_bool = mask_f > jnp.float32(0.5)
+        out, _lse = _flash_attn_with_sink_pallas(
+            q, K_full, mask_bool, attn_sink, scale=scale, config=config,
+        )
+        return out
+
+    def _fwd(q, K_full, mask_f, attn_sink):
+        mask_bool = mask_f > jnp.float32(0.5)
+        out, lse = _flash_attn_with_sink_pallas(
+            q, K_full, mask_bool, attn_sink, scale=scale, config=config,
+        )
+        return out, (q, K_full, mask_f, mask_bool, attn_sink, out, lse)
+
+    def _bwd(res, dout):
+        q, K_full, mask_f, mask_bool, attn_sink, out, lse = res
+        dq, dk, dsink = _flash_attn_with_sink_pallas_bwd(
+            q, K_full, mask_bool, attn_sink, out, lse, dout,
+            scale=scale, config=config,
+        )
+        # Cotangents matching the four primal args: (q, K_full, mask_f, attn_sink).
+        return dq, dk, jnp.zeros_like(mask_f), dsink
+
+    _flash.defvjp(_fwd, _bwd)
+    return _flash
+
+
 def _v1_forward(q, K_comp, topk_idxs, K_swa, attn_sink, *, config: KernelConfig):
     B, n, n_h, c = q.shape
     K_full, mask = _gather_concat_mask(q, K_comp, topk_idxs, K_swa)
@@ -288,44 +540,15 @@ def _v1_forward(q, K_comp, topk_idxs, K_swa, attn_sink, *, config: KernelConfig)
         K_full = jnp.pad(K_full, ((0, 0), (0, 0), (0, pad_s), (0, 0)))
         mask = jnp.pad(mask, ((0, 0), (0, 0), (0, pad_s)), constant_values=False)
 
-    scale = float(c) ** -0.5
-    out = _flash_attn_with_sink_pallas(
-        q, K_full, mask, attn_sink, scale=scale, config=config
-    )
+    # Cast bool→fp32 for the custom_vjp boundary, then call the diffable
+    # closure. The bwd of the bool→fp32 cast is naturally zero, which is
+    # correct (mask is a function of topk_idxs, which has no float grad).
+    mask_f = mask.astype(jnp.float32)
+    out = _make_flash_diffable(config, c)(q, K_full, mask_f, attn_sink)
+
     if pad_n:
         out = out[:, :n]
     return out
-
-
-@lru_cache(maxsize=None)
-def _make_v1_kernel(config: KernelConfig):
-    """Build a ``custom_vjp``-wrapped kernel specialized for ``config``.
-
-    Cached on the (frozen, hashable) config so repeat calls with the same
-    config reuse one closure — that's what keeps the JIT trace cache hot
-    across calls. Each distinct config gets its own specialized fn.
-    """
-
-    @jax.custom_vjp
-    def fn(q, K_comp, topk_idxs, K_swa, attn_sink):
-        return _v1_forward(q, K_comp, topk_idxs, K_swa, attn_sink, config=config)
-
-    def _fwd(q, K_comp, topk_idxs, K_swa, attn_sink):
-        out = _v1_forward(q, K_comp, topk_idxs, K_swa, attn_sink, config=config)
-        return out, (q, K_comp, topk_idxs, K_swa, attn_sink)
-
-    def _bwd(res, dout):
-        # v2: replace with a hand-written Pallas backward (kernel_refs.md §D3),
-        # accumulating KV grads into per-program deterministic scratch
-        # (paper §3.3).
-        q, K_comp, topk_idxs, K_swa, attn_sink = res
-        _, vjp_fn = jax.vjp(
-            ref.sparse_attn_with_sink, q, K_comp, topk_idxs, K_swa, attn_sink
-        )
-        return vjp_fn(dout)
-
-    fn.defvjp(_fwd, _bwd)
-    return fn
 
 
 def sparse_attn_kernel_v1(
@@ -337,12 +560,14 @@ def sparse_attn_kernel_v1(
     *,
     config: KernelConfig | None = None,
 ) -> jax.Array:
-    """V1 Pallas forward for the CSA sparse-MQA core.
+    """V1 Pallas forward+bwd for the CSA sparse-MQA core.
 
     Surface matches ``dsv4.kernel.sparse_attn_kernel`` exactly so call sites
-    don't change. Backward defers to autodiff through the reference impl;
-    that's wrong for performance but correct for gradients, and gives v2
-    something concrete to beat.
+    don't change. The Pallas forward emits ``lse`` as a saved residual; the
+    custom_vjp boundary (around just the Pallas call, not the gather/concat)
+    dispatches to the hand-written Pallas bwd that recomputes ``p`` from
+    ``lse`` and accumulates ``dq`` / ``dk`` / ``dsink`` (see the bwd kernel
+    docstring above).
 
     ``config`` controls block sizes & lane width. When ``None`` (the
     default), the local TPU generation is auto-detected via
@@ -352,4 +577,4 @@ def sparse_attn_kernel_v1(
     if config is None:
         _, _, n_h, c = q.shape
         config = default_config(n_h=n_h, c=c)
-    return _make_v1_kernel(config)(q, K_comp, topk_idxs, K_swa, attn_sink)
+    return _v1_forward(q, K_comp, topk_idxs, K_swa, attn_sink, config=config)

@@ -24,18 +24,24 @@ which provides:
 Why no custom_vjp at this layer
 -------------------------------
 
-V2's inner ``_make_*_kernel`` factories already wire ``jax.custom_vjp``
-around the diff-able array inputs, with non-diff Python primitives
-(``hc``, ``sinkhorn_iters``, ``eps``, configs) captured via closure
-instead of leaking through the custom_vjp boundary. Wrapping a SECOND
-custom_vjp at this layer would coerce those Python primitives into
-tracers (``DynamicJaxprTracer``) and then fail at any concrete Python
-use downstream (slicing, dataclass field access, ``lru_cache`` key
-lookup). The reference path's natural autodiff works the same way.
+The custom_vjp boundaries live inside V1 / V2:
 
-Backward defers to autodiff through the eager reference for all four
-ops in V2. Hand-written Pallas backwards (kernel_refs.md §D3) are V3+
-work.
+  - ``kernel_v1`` wraps ``jax.custom_vjp`` around just the Pallas
+    flash-with-sink call, with the saved-(lse) hand-written bwd kernel
+    (kernel_refs §D3). The gather/concat preamble stays in plain JAX,
+    so natural autodiff handles dK_comp / dK_swa.
+  - ``kernel_v2`` wraps ``jax.custom_vjp`` around the sinkhorn forward
+    only, dispatching the bwd to a second Pallas kernel that runs
+    ``jax.vjp`` over a pure forward (mirroring the reference's scan).
+    CSA / HCA take natural autodiff — their preamble is regular JAX
+    GEMMs and the only Pallas op (``sparse_attn_kernel_v2``) brings its
+    own custom_vjp from V1.
+
+Wrapping a SECOND custom_vjp at this layer would coerce non-diff Python
+primitives (``hc``, ``sinkhorn_iters``, ``eps``, configs) into tracers
+(``DynamicJaxprTracer``) and then fail at any concrete Python use
+downstream (slicing, dataclass field access, ``lru_cache`` key lookup).
+Keeping the boundary narrow inside V1 / V2 sidesteps that.
 
 Set ``DSV4_KERNEL=ref`` in the env to bypass V2 and route every
 entrypoint to the eager reference (useful for sanity-checking the

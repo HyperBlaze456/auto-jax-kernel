@@ -49,12 +49,36 @@ in v1).
 Backward
 --------
 
-All four entrypoints use ``jax.custom_vjp`` with a backward that
-autodiffs through the eager reference. That's slower than a hand-written
-backward (Pallas FlashAttention's saved-residual recompute, kernel_refs
-§D3) but correct, deterministic, and tolerance-safe. Hand-writing the
-backward is a V3+ item: kernel_v1's docstring already documents the
-intended pattern.
+V2 carries hand-written Pallas backwards for the two ops where they
+matter for memory/compute:
+
+  - ``sparse_attn_kernel_v2`` inherits V1's saved-(lse) FlashAttention
+    backward (kernel_refs §D3). Re-exporting V1's kernel means CSA and
+    HCA pick the bwd up for free through natural autodiff over the JAX
+    preamble (compressor, indexer, top-k, RoPE, RMSNorm).
+  - ``mhc_sinkhorn_kernel_v2`` has a dedicated Pallas bwd that runs
+    ``jax.vjp`` over a pure inner forward (matching the reference) for
+    the 19-iter sinkhorn body. That keeps the hc×hc residual stack in
+    VMEM rather than re-materializing 19 intermediate matrices in HBM.
+    The affine outer step (``comb_init = comb_raw · hc_scale[2] +
+    comb_bias``) and the pre/post sigmoid paths fall out via closed-form
+    JAX outside the kernel — they don't need Pallas residuals.
+
+CSA and HCA themselves no longer need a custom_vjp at this layer: their
+JAX preamble is regular GEMM/softmax that XLA autodiffs natively, and
+the only Pallas op in the chain (``sparse_attn_kernel_v2``) brings its
+own custom_vjp from V1.
+
+What's still V3+ (kernel_refs §D3, paper §3.3)
+----------------------------------------------
+
+  - Per-program deterministic KV-grad scratch for streaming bwd across
+    very long S. V1's bwd writes dk per (b, qi, si) tile, which is
+    already deterministic because no two programs target the same slot;
+    the §3.3 pattern only matters once a streaming bwd shares K entries
+    across programs.
+  - Streaming HCA dense path (n_blk > 4096). Still raises; same
+    limitation as the reference.
 """
 
 from __future__ import annotations
@@ -338,6 +362,191 @@ def _sinkhorn_pallas(
       hc_scale, pre_bias, post_bias, comb_bias)
 
 
+# ---------------------------------------------------------------------------
+# mHC Sinkhorn backward (per-token Pallas kernel for the 19-iter loop only)
+# ---------------------------------------------------------------------------
+#
+# The bwd splits cleanly into three pieces:
+#
+#   (1) Pre / post sigmoid path: closed-form JAX outside the kernel.
+#       ``pre = sigmoid(z_pre) + eps`` with ``z_pre = pre_raw · hc_scale[0] +
+#       pre_bias`` — sigmoid bwd is a one-line ``sig · (1 - sig)`` multiply.
+#       No iterative residuals to save, so no Pallas win.
+#
+#   (2) Comb sinkhorn iterations: Pallas. The 19-step row/col-normalize
+#       loop needs intermediate residuals to autodiff. Running ``jax.vjp``
+#       over a pure forward (mirroring ``reference.mhc_sinkhorn``'s scan)
+#       inside a Pallas kernel keeps those residuals in VMEM scratch.
+#
+#   (3) Affine outer step on comb (``comb_init = comb_raw · hc_scale[2] +
+#       comb_bias``): closed-form JAX outside. The kernel outputs the
+#       cotangent on ``comb_init``; the wrapper turns that into
+#       ``dcomb_raw``, ``dhc_scale[2]``, ``dcomb_bias``.
+#
+# Why pure-function + jax.vjp inside Pallas rather than a hand-derived
+# analytic bwd for the 19 iterations: the row/col-normalize step has a
+# non-trivial Jacobian (``y = x / (sum(x) + eps)``), and writing it out
+# explicitly times 19 iterations is a lot of code with no clear win over
+# what jax.vjp already produces — both end up storing the per-iter ``c``
+# in VMEM. The bwd kernel is computationally what kernel_refs §D3
+# advocates (saved-residual recompute), just expressed via jax.vjp.
+
+
+def _sinkhorn_norm_pure(comb_init, *, sinkhorn_iters, eps):
+    """Pure forward for the post-affine comb normalization path.
+
+    Mirrors ``reference.mhc_sinkhorn``'s scan-based iteration (NOT the
+    Pallas forward's ``fori_loop`` — fori_loop is non-differentiable,
+    while scan natively supports reverse-mode autodiff). The two paths
+    are numerically identical for the same iteration count.
+    """
+    comb = jax.nn.softmax(comb_init, axis=-1) + jnp.float32(eps)
+    comb = comb / (comb.sum(axis=-2, keepdims=True) + jnp.float32(eps))
+
+    def step(c, _):
+        c = c / (c.sum(axis=-1, keepdims=True) + jnp.float32(eps))
+        c = c / (c.sum(axis=-2, keepdims=True) + jnp.float32(eps))
+        return c, None
+
+    comb, _ = jax.lax.scan(step, comb, None, length=sinkhorn_iters - 1)
+    return comb
+
+
+def _sinkhorn_norm_body_bwd(
+    comb_init_ref,    # [1, BN, hc, hc]  bf16/f32  — in
+    dcomb_ref,        # [1, BN, hc, hc]  bf16/f32  — in (upstream)
+    dcomb_init_ref,   # [1, BN, hc, hc]  bf16/f32  — out (cotangent on comb_init)
+    *,
+    sinkhorn_iters: int,
+    eps: float,
+):
+    comb_init = comb_init_ref[...].astype(jnp.float32)
+    dcomb = dcomb_ref[...].astype(jnp.float32)
+
+    _, vjp_fn = jax.vjp(
+        partial(_sinkhorn_norm_pure, sinkhorn_iters=sinkhorn_iters, eps=eps),
+        comb_init,
+    )
+    (dcomb_init,) = vjp_fn(dcomb)
+    dcomb_init_ref[...] = dcomb_init.astype(dcomb_init_ref.dtype)
+
+
+def _sinkhorn_norm_pallas_bwd(
+    comb_init: jax.Array,   # [B, n, hc, hc]
+    dcomb: jax.Array,       # [B, n, hc, hc]
+    *,
+    sinkhorn_iters: int,
+    eps: float,
+    config: KernelConfig,
+) -> jax.Array:
+    """Returns ``dcomb_init`` of the same shape as ``comb_init``."""
+    B, n, hc, _ = comb_init.shape
+    bn = config.bn_sinkhorn
+    if n % bn != 0:
+        raise ValueError(f"n={n} must be a multiple of BN_sinkhorn={bn}; pad in the wrapper")
+
+    grid = (B, n // bn)
+    spec_4d = pl.BlockSpec((1, bn, hc, hc), lambda b, ni: (b, ni, 0, 0))
+
+    return pl.pallas_call(
+        partial(_sinkhorn_norm_body_bwd, sinkhorn_iters=sinkhorn_iters, eps=eps),
+        grid=grid,
+        in_specs=[spec_4d, spec_4d],
+        out_specs=spec_4d,
+        out_shape=jax.ShapeDtypeStruct(comb_init.shape, comb_init.dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+        ),
+        interpret=config.interpret,
+    )(comb_init, dcomb)
+
+
+def _mhc_sinkhorn_v2_bwd(
+    res, douts, *, hc: int, sinkhorn_iters: int, eps: float, config: KernelConfig,
+):
+    """Custom-vjp backward for ``_mhc_sinkhorn_v2``.
+
+    Returns ``(dmixes, dhc_scale, dhc_base)`` matching the forward's
+    diff'd inputs. The pre/post and affine outer comb paths are
+    closed-form in JAX; only the 19-iter sinkhorn loop goes through
+    Pallas.
+    """
+    mixes, hc_scale, hc_base = res
+    dpre, dpost, dcomb = douts
+    B, n, _ = mixes.shape
+
+    # Split / reshape — mirrors the forward.
+    pre_raw = mixes[..., :hc]                               # [B, n, hc]
+    post_raw = mixes[..., hc:2 * hc]                         # [B, n, hc]
+    comb_raw = mixes[..., 2 * hc:].reshape(B, n, hc, hc)     # [B, n, hc, hc]
+    pre_bias = hc_base[:hc]
+    post_bias = hc_base[hc:2 * hc]
+    comb_bias = hc_base[2 * hc:].reshape(hc, hc)
+
+    # --- (1) Pre/post sigmoid bwd, all in JAX. ---
+    pre_raw_f = pre_raw.astype(jnp.float32)
+    post_raw_f = post_raw.astype(jnp.float32)
+    hc_scale_f = hc_scale.astype(jnp.float32)
+
+    z_pre = pre_raw_f * hc_scale_f[0] + pre_bias.astype(jnp.float32)
+    sig_pre = jax.nn.sigmoid(z_pre)
+    dz_pre = dpre.astype(jnp.float32) * sig_pre * (1.0 - sig_pre)   # [B, n, hc]
+    dpre_raw = (dz_pre * hc_scale_f[0]).astype(mixes.dtype)
+    dpre_bias = dz_pre.sum(axis=(0, 1))                              # [hc]
+    dhc_scale_0 = (dz_pre * pre_raw_f).sum()
+
+    z_post = post_raw_f * hc_scale_f[1] + post_bias.astype(jnp.float32)
+    sig_post = jax.nn.sigmoid(z_post)
+    dz_post = dpost.astype(jnp.float32) * 2.0 * sig_post * (1.0 - sig_post)
+    dpost_raw = (dz_post * hc_scale_f[1]).astype(mixes.dtype)
+    dpost_bias = dz_post.sum(axis=(0, 1))                            # [hc]
+    dhc_scale_1 = (dz_post * post_raw_f).sum()
+
+    # --- (2) Comb sinkhorn bwd, Pallas. ---
+    comb_init = (comb_raw.astype(jnp.float32) * hc_scale_f[2]
+                 + comb_bias.astype(jnp.float32))                    # [B, n, hc, hc]
+    # Match the forward's dtype to keep the kernel's compute path consistent.
+    comb_init = comb_init.astype(mixes.dtype)
+    dcomb_padded = dcomb.astype(mixes.dtype)
+
+    bn = config.bn_sinkhorn
+    pad_n = (-n) % bn
+    if pad_n:
+        comb_init = jnp.pad(comb_init, ((0, 0), (0, pad_n), (0, 0), (0, 0)))
+        dcomb_padded = jnp.pad(dcomb_padded, ((0, 0), (0, pad_n), (0, 0), (0, 0)))
+
+    dcomb_init_padded = _sinkhorn_norm_pallas_bwd(
+        comb_init, dcomb_padded,
+        sinkhorn_iters=sinkhorn_iters, eps=eps, config=config,
+    )
+
+    if pad_n:
+        dcomb_init = dcomb_init_padded[:, :n]
+    else:
+        dcomb_init = dcomb_init_padded
+    dcomb_init_f = dcomb_init.astype(jnp.float32)
+
+    # --- (3) Affine outer step bwd on comb, JAX. ---
+    comb_raw_f = comb_raw.astype(jnp.float32)
+    dcomb_raw = (dcomb_init_f * hc_scale_f[2]).astype(mixes.dtype)   # [B, n, hc, hc]
+    dcomb_bias = dcomb_init_f.sum(axis=(0, 1))                        # [hc, hc]
+    dhc_scale_2 = (dcomb_init_f * comb_raw_f).sum()
+
+    # Reassemble dmixes (concat the three split parts back into the last dim)
+    # and dhc_base (concat the three bias parts into the flat hc_base layout).
+    dmixes = jnp.concatenate(
+        [dpre_raw, dpost_raw, dcomb_raw.reshape(B, n, hc * hc)],
+        axis=-1,
+    )
+    dhc_base = jnp.concatenate(
+        [dpre_bias, dpost_bias, dcomb_bias.reshape(hc * hc)],
+        axis=0,
+    ).astype(hc_base.dtype)
+    dhc_scale = jnp.stack([dhc_scale_0, dhc_scale_1, dhc_scale_2]).astype(hc_scale.dtype)
+
+    return dmixes, dhc_scale, dhc_base
+
+
 def _mhc_sinkhorn_v2(
     mixes: jax.Array,
     hc_scale: jax.Array,
@@ -389,48 +598,18 @@ def _mhc_sinkhorn_v2(
 
 
 # ---------------------------------------------------------------------------
-# Public entrypoints with custom_vjp wiring
+# Public entrypoints
 # ---------------------------------------------------------------------------
 #
-# All four entrypoints follow the same pattern: forward dispatches to the
-# Pallas kernel; backward autodiffs through the eager reference. The
-# closure cache keyed on ``config`` keeps the JIT trace cache hot across
-# calls — same trick as ``kernel_v1._make_v1_kernel``.
-
-@lru_cache(maxsize=None)
-def _make_csa_kernel(config: KernelConfig, cfg: ref.CSAConfig):
-    @jax.custom_vjp
-    def fn(H, params):
-        return _csa_forward_v2(H, params, cfg, config=config)
-
-    def _fwd(H, params):
-        return _csa_forward_v2(H, params, cfg, config=config), (H, params)
-
-    def _bwd(res, dout):
-        H, params = res
-        _, vjp_fn = jax.vjp(lambda H, p: ref.csa_forward(H, p, cfg), H, params)
-        return vjp_fn(dout)
-
-    fn.defvjp(_fwd, _bwd)
-    return fn
-
-
-@lru_cache(maxsize=None)
-def _make_hca_kernel(config: KernelConfig, cfg: ref.HCAConfig):
-    @jax.custom_vjp
-    def fn(H, params):
-        return _hca_forward_v2(H, params, cfg, config=config)
-
-    def _fwd(H, params):
-        return _hca_forward_v2(H, params, cfg, config=config), (H, params)
-
-    def _bwd(res, dout):
-        H, params = res
-        _, vjp_fn = jax.vjp(lambda H, p: ref.hca_forward(H, p, cfg), H, params)
-        return vjp_fn(dout)
-
-    fn.defvjp(_fwd, _bwd)
-    return fn
+# CSA / HCA have no custom_vjp at this layer: the only Pallas op in their
+# chain (``sparse_attn_kernel_v2``, re-exporting V1) brings its own
+# hand-written custom_vjp from V1, and the rest of the preamble is plain
+# JAX that XLA autodiffs natively. The lru_cache + closure pattern is no
+# longer needed for these — JAX's jit cache handles trace reuse.
+#
+# Sinkhorn keeps a custom_vjp because ``pl.pallas_call`` is not
+# autodifferentiable on TPU by default; the bwd is the hand-written
+# Pallas kernel above (see ``_mhc_sinkhorn_v2_bwd``).
 
 
 @lru_cache(maxsize=None)
@@ -448,12 +627,10 @@ def _make_sinkhorn_kernel(config: KernelConfig, hc: int, sinkhorn_iters: int, ep
         return out, (mixes, hc_scale, hc_base)
 
     def _bwd(res, douts):
-        mixes, hc_scale, hc_base = res
-        _, vjp_fn = jax.vjp(
-            lambda m, s, b: ref.mhc_sinkhorn(m, s, b, hc, sinkhorn_iters, eps),
-            mixes, hc_scale, hc_base,
+        return _mhc_sinkhorn_v2_bwd(
+            res, douts,
+            hc=hc, sinkhorn_iters=sinkhorn_iters, eps=eps, config=config,
         )
-        return vjp_fn(douts)
 
     fn.defvjp(_fwd, _bwd)
     return fn
@@ -471,10 +648,14 @@ def csa_forward_kernel_v2(
     JAX-handled preamble (compress, indexer, top-k, RoPE, RMSNorm); Pallas
     FlashAttention-with-sink for the sparse MQA core. Generation-agnostic
     via ``KernelConfig`` (auto-detected when ``config is None``).
+
+    Backward is natural autodiff: the JAX preamble autodiffs natively;
+    the sparse-MQA Pallas core's bwd comes from V1's hand-written
+    ``custom_vjp`` (saved-lse FlashAttention bwd).
     """
     if config is None:
         config = default_config(n_h=cfg.n_h, c=cfg.c)
-    return _make_csa_kernel(config, cfg)(H, params)
+    return _csa_forward_v2(H, params, cfg, config=config)
 
 
 def hca_forward_kernel_v2(
@@ -489,10 +670,13 @@ def hca_forward_kernel_v2(
     Reuses the same Pallas sparse-MQA kernel as CSA, with a select-all
     block-causal mask in place of top-k indices. Errors at n_blk > 4096
     (same as the reference) until a streaming Pallas variant lands in V3+.
+
+    Backward path is the same as CSA: natural autodiff over the JAX
+    preamble + V1's hand-written sparse-MQA bwd.
     """
     if config is None:
         config = default_config(n_h=cfg.n_h, c=cfg.c)
-    return _make_hca_kernel(config, cfg)(H, params)
+    return _hca_forward_v2(H, params, cfg, config=config)
 
 
 def mhc_sinkhorn_kernel_v2(
@@ -505,7 +689,12 @@ def mhc_sinkhorn_kernel_v2(
     *,
     config: KernelConfig | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Pallas mHC Sinkhorn projection (matches ``reference.mhc_sinkhorn``)."""
+    """Pallas mHC Sinkhorn projection (matches ``reference.mhc_sinkhorn``).
+
+    Forward keeps the hc×hc matrix in VMEM across the 19-iter loop;
+    backward (see ``_mhc_sinkhorn_v2_bwd``) does the same for the
+    cotangent path via ``jax.vjp`` inside a second Pallas kernel.
+    """
     if config is None:
         # hc/c values don't drive the sinkhorn tile budget; pick something
         # sane just to populate the rest of KernelConfig (bq/bs are unused
