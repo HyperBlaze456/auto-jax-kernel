@@ -18,7 +18,7 @@ better-grained signal for low-level kernel work than torch.profiler.
 ```
 DeepSeek_V4.pdf      spec (CSA, HCA, SWA, mHC Sinkhorn)
 kernel_refs.md       Pallas-TPU + sharding reference card for the agent
-dsv4/reference.py    eager-JAX oracle (read-only) — ground truth for correctness
+dsv4/eager.py        eager-JAX oracle (read-only) — ground truth for correctness
 dsv4/kernel.py       Pallas-TPU surface (agent edits this)
 bench.py             latency + MFU + correctness harness
 program.md           agent loop instructions

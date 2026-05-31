@@ -440,7 +440,7 @@ def _flash_attn_with_sink_pallas_bwd(
 # ---------------------------------------------------------------------------
 
 def _gather_concat_mask(q, K_comp, topk_idxs, K_swa):
-    """The gather-and-concat preamble (same shape as ``ref.sparse_attn_with_sink``).
+    """The gather-and-concat preamble (same shape as ``eager.sparse_attn_with_sink``).
 
     Returns ``(K_full, mask)`` with K_full of shape ``[B, n, k+n_win, c]`` and a
     bool mask of the same leading shape. -1 padding entries in ``topk_idxs``

@@ -28,7 +28,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 
-from dsv4 import kernel, reference as ref
+from dsv4 import kernel, eager
 
 
 # ---------------------------------------------------------------------------
@@ -62,12 +62,12 @@ def detect_peak_tflops(override: float | None) -> tuple[float, str]:
 # ---------------------------------------------------------------------------
 
 PRESETS = {
-    "small_csa":      ("csa", ref.SMALL_CSA),
-    "small_hca":      ("hca", ref.SMALL_HCA),
-    "dsv4_flash_csa": ("csa", ref.DSV4_FLASH_CSA),
-    "dsv4_flash_hca": ("hca", ref.DSV4_FLASH_HCA),
-    "dsv4_pro_csa":   ("csa", ref.DSV4_PRO_CSA),
-    "dsv4_pro_hca":   ("hca", ref.DSV4_PRO_HCA),
+    "small_csa":      ("csa", eager.SMALL_CSA),
+    "small_hca":      ("hca", eager.SMALL_HCA),
+    "dsv4_flash_csa": ("csa", eager.DSV4_FLASH_CSA),
+    "dsv4_flash_hca": ("hca", eager.DSV4_FLASH_HCA),
+    "dsv4_pro_csa":   ("csa", eager.DSV4_PRO_CSA),
+    "dsv4_pro_hca":   ("hca", eager.DSV4_PRO_HCA),
 }
 
 
@@ -115,17 +115,17 @@ def time_fn(fn: Callable, *args, warmup: int = 3, iters: int = 10) -> TimingResu
 # Per-preset bench
 # ---------------------------------------------------------------------------
 
-def bench_csa(cfg: ref.CSAConfig, B: int, n: int, do_bwd: bool, dtype, seed: int):
+def bench_csa(cfg: eager.CSAConfig, B: int, n: int, do_bwd: bool, dtype, seed: int):
     key = jax.random.PRNGKey(seed)
     k_h, k_p = jax.random.split(key)
     H = jax.random.normal(k_h, (B, n, cfg.d), dtype=dtype)
-    params = ref.init_csa_params(k_p, cfg, dtype=dtype)
+    params = eager.init_csa_params(k_p, cfg, dtype=dtype)
 
     def fwd(H, params):
         return kernel.csa_forward_kernel(H, params, cfg)
 
     fwd_jit = jax.jit(fwd)
-    ref_jit = jax.jit(lambda H, p: ref.csa_forward(H, p, cfg))
+    ref_jit = jax.jit(lambda H, p: eager.csa_forward(H, p, cfg))
 
     # Correctness: run both, compare.
     y_kernel = fwd_jit(H, params); _wait(y_kernel)
@@ -143,21 +143,21 @@ def bench_csa(cfg: ref.CSAConfig, B: int, n: int, do_bwd: bool, dtype, seed: int
         grad_jit = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
         bwd_t = time_fn(grad_jit, H, params)
 
-    flops = ref.csa_flops(cfg, B, n)
+    flops = eager.csa_flops(cfg, B, n)
     return y_kernel, max_abs_diff, fwd_t, bwd_t, flops
 
 
-def bench_hca(cfg: ref.HCAConfig, B: int, n: int, do_bwd: bool, dtype, seed: int):
+def bench_hca(cfg: eager.HCAConfig, B: int, n: int, do_bwd: bool, dtype, seed: int):
     key = jax.random.PRNGKey(seed)
     k_h, k_p = jax.random.split(key)
     H = jax.random.normal(k_h, (B, n, cfg.d), dtype=dtype)
-    params = ref.init_hca_params(k_p, cfg, dtype=dtype)
+    params = eager.init_hca_params(k_p, cfg, dtype=dtype)
 
     def fwd(H, params):
         return kernel.hca_forward_kernel(H, params, cfg)
 
     fwd_jit = jax.jit(fwd)
-    ref_jit = jax.jit(lambda H, p: ref.hca_forward(H, p, cfg))
+    ref_jit = jax.jit(lambda H, p: eager.hca_forward(H, p, cfg))
 
     y_kernel = fwd_jit(H, params); _wait(y_kernel)
     y_ref = ref_jit(H, params);    _wait(y_ref)
@@ -171,7 +171,7 @@ def bench_hca(cfg: ref.HCAConfig, B: int, n: int, do_bwd: bool, dtype, seed: int
         grad_jit = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
         bwd_t = time_fn(grad_jit, H, params)
 
-    flops = ref.hca_flops(cfg, B, n)
+    flops = eager.hca_flops(cfg, B, n)
     return y_kernel, max_abs_diff, fwd_t, bwd_t, flops
 
 

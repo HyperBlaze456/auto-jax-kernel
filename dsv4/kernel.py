@@ -18,7 +18,7 @@ which provides:
     (generation-agnostic via dsv4.kernel_config).
   - csa_forward_kernel_v2: full CSA forward (JAX preamble + Pallas core).
   - hca_forward_kernel_v2: full HCA forward (same Pallas core via
-    select-all + block-causal-mask, mirroring reference.hca_forward).
+    select-all + block-causal-mask, mirroring eager.hca_forward).
   - mhc_sinkhorn_kernel_v2: per-token Pallas sinkhorn iteration loop.
 
 Why no custom_vjp at this layer
@@ -54,7 +54,7 @@ import os
 
 import jax
 
-from . import kernel_v2, reference as ref
+from . import kernel_v2, eager
 
 
 # ``DSV4_KERNEL=ref`` forces the reference path (eager JAX, no Pallas).
@@ -74,7 +74,7 @@ def sparse_attn_kernel(
     attn_sink: jax.Array,
 ) -> jax.Array:
     if _USE_REF:
-        return ref.sparse_attn_with_sink(q, K_comp, topk_idxs, K_swa, attn_sink)
+        return eager.sparse_attn_with_sink(q, K_comp, topk_idxs, K_swa, attn_sink)
     return kernel_v2.sparse_attn_kernel_v2(q, K_comp, topk_idxs, K_swa, attn_sink)
 
 
@@ -82,7 +82,7 @@ def sparse_attn_kernel(
 # CSA / HCA full forward (compressor + indexer + MQA composed)
 # ---------------------------------------------------------------------------
 
-def csa_forward_kernel(H: jax.Array, params: ref.CSAParams, cfg: ref.CSAConfig) -> jax.Array:
+def csa_forward_kernel(H: jax.Array, params: eager.CSAParams, cfg: eager.CSAConfig) -> jax.Array:
     """End-to-end CSA forward.
 
     JAX-handled preamble (compressor, indexer, top-k, RoPE, RMSNorm) +
@@ -93,12 +93,12 @@ def csa_forward_kernel(H: jax.Array, params: ref.CSAParams, cfg: ref.CSAConfig) 
     """
     if _USE_REF:
         with jax.named_scope("csa_forward_ref"):
-            return ref.csa_forward(H, params, cfg)
+            return eager.csa_forward(H, params, cfg)
     with jax.named_scope("csa_forward"):
         return kernel_v2.csa_forward_kernel_v2(H, params, cfg)
 
 
-def hca_forward_kernel(H: jax.Array, params: ref.HCAParams, cfg: ref.HCAConfig) -> jax.Array:
+def hca_forward_kernel(H: jax.Array, params: eager.HCAParams, cfg: eager.HCAConfig) -> jax.Array:
     """End-to-end HCA forward.
 
     Reuses the same Pallas sparse-MQA kernel as CSA, with a select-all
@@ -107,7 +107,7 @@ def hca_forward_kernel(H: jax.Array, params: ref.HCAParams, cfg: ref.HCAConfig) 
     """
     if _USE_REF:
         with jax.named_scope("hca_forward_ref"):
-            return ref.hca_forward(H, params, cfg)
+            return eager.hca_forward(H, params, cfg)
     with jax.named_scope("hca_forward"):
         return kernel_v2.hca_forward_kernel_v2(H, params, cfg)
 
@@ -129,7 +129,7 @@ def mhc_sinkhorn_kernel(
     being treated as JAX arrays (see module docstring on custom_vjp).
     """
     if _USE_REF:
-        return ref.mhc_sinkhorn(mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps)
+        return eager.mhc_sinkhorn(mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps)
     return kernel_v2.mhc_sinkhorn_kernel_v2(
         mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps,
     )

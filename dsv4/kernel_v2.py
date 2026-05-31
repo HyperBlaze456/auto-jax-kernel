@@ -18,7 +18,7 @@ V2 closes that gap. The headline additions:
   2. ``hca_forward_kernel_v2`` — full HCA forward. Routes the dense-MQA
      core through the *same* Pallas kernel as CSA, by building a
      "select-all blocks with block-causal mask" ``topk_idxs`` (mirroring
-     ``reference.hca_forward``'s ``n_blk <= 4096`` branch). This swaps the
+     ``eager.hca_forward``'s ``n_blk <= 4096`` branch). This swaps the
      [B, n, n_h, n_blk] attention-weights materialization the reference
      does for FlashAttention's running ``(m, l, acc)``.
   3. ``mhc_sinkhorn_kernel_v2`` — per-token Pallas kernel for the
@@ -90,7 +90,7 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
-from . import reference as ref
+from . import eager
 from .kernel_config import KernelConfig, default_config
 from .kernel_v1 import sparse_attn_kernel_v1
 
@@ -122,27 +122,27 @@ def sparse_attn_kernel_v2(
 # CSA full forward (Pallas attention core + JAX preamble)
 # ---------------------------------------------------------------------------
 #
-# The structure mirrors ``reference.csa_forward`` exactly; only the final
-# ``ref.sparse_attn_with_sink`` call is swapped for the Pallas kernel.
+# The structure mirrors ``eager.csa_forward`` exactly; only the final
+# ``eager.sparse_attn_with_sink`` call is swapped for the Pallas kernel.
 
 def _csa_forward_v2(
-    H: jax.Array, p: ref.CSAParams, cfg: ref.CSAConfig, *, config: KernelConfig,
+    H: jax.Array, p: eager.CSAParams, cfg: eager.CSAConfig, *, config: KernelConfig,
 ) -> jax.Array:
     B, n, d = H.shape
 
     with jax.named_scope("csa_compress"):
-        K_comp = ref.csa_compress(
+        K_comp = eager.csa_compress(
             H, p.W_aKV, p.W_bKV, p.W_aZ, p.W_bZ, p.B_a, p.B_b, cfg.m,
         )                                                       # [B, n/m, c]
-        K_IComp = ref.csa_compress(
+        K_IComp = eager.csa_compress(
             H, p.W_aIK, p.W_bIK, p.W_aIZ, p.W_bIZ, p.B_aI, p.B_bI, cfg.m,
         )                                                       # [B, n/m, c_I]
 
     with jax.named_scope("csa_indexer"):
-        scores = ref.lightning_indexer(
+        scores = eager.lightning_indexer(
             H, K_IComp, p.W_DQ, p.W_IUQ, p.W_w, cfg.m, cfg.n_I_h, cfg.c_I,
         )
-        topk_idxs = ref.topk_indices(scores, cfg.topk)          # [B, n, k]
+        topk_idxs = eager.topk_indices(scores, cfg.topk)          # [B, n, k]
 
     with jax.named_scope("csa_qkv_proj"):
         cQ = H @ p.W_DQ
@@ -150,27 +150,27 @@ def _csa_forward_v2(
         K_swa_full = H @ p.W_swaK                               # [B, n, c]
 
     with jax.named_scope("csa_rope"):
-        cos_q, sin_q = ref._build_rope(n, cfg.rope_dim)
-        q = ref.apply_partial_rope(
+        cos_q, sin_q = eager._build_rope(n, cfg.rope_dim)
+        q = eager.apply_partial_rope(
             q, cos_q[None, :, None, :], sin_q[None, :, None, :], cfg.rope_dim,
         )
         n_blk = K_comp.shape[1]
-        cos_k, sin_k = ref._build_rope(n_blk, cfg.rope_dim)
-        K_comp = ref.apply_partial_rope(
+        cos_k, sin_k = eager._build_rope(n_blk, cfg.rope_dim)
+        K_comp = eager.apply_partial_rope(
             K_comp, cos_k[None, :, :], sin_k[None, :, :], cfg.rope_dim,
         )
-        cos_s, sin_s = ref._build_rope(n, cfg.rope_dim)
-        K_swa_full = ref.apply_partial_rope(
+        cos_s, sin_s = eager._build_rope(n, cfg.rope_dim)
+        K_swa_full = eager.apply_partial_rope(
             K_swa_full, cos_s[None, :, :], sin_s[None, :, :], cfg.rope_dim,
         )
 
     with jax.named_scope("csa_swa_gather"):
-        K_swa = ref.swa_gather(K_swa_full, cfg.n_win)           # [B, n, n_win, c]
+        K_swa = eager.swa_gather(K_swa_full, cfg.n_win)           # [B, n, n_win, c]
 
     with jax.named_scope("csa_rmsnorm"):
-        q = ref.rms_norm(q)
-        K_comp = ref.rms_norm(K_comp)
-        K_swa = ref.rms_norm(K_swa)
+        q = eager.rms_norm(q)
+        K_comp = eager.rms_norm(K_comp)
+        K_swa = eager.rms_norm(K_swa)
 
     with jax.named_scope("csa_sparse_mqa"):
         return sparse_attn_kernel_v2(
@@ -191,12 +191,12 @@ def _csa_forward_v2(
 # memory hog at scale) but the streaming path is still V3+ territory.
 
 def _hca_forward_v2(
-    H: jax.Array, p: ref.HCAParams, cfg: ref.HCAConfig, *, config: KernelConfig,
+    H: jax.Array, p: eager.HCAParams, cfg: eager.HCAConfig, *, config: KernelConfig,
 ) -> jax.Array:
     B, n, d = H.shape
 
     with jax.named_scope("hca_compress"):
-        K_comp = ref.hca_compress(H, p.W_KV, p.W_Z, p.B, cfg.m_prime)
+        K_comp = eager.hca_compress(H, p.W_KV, p.W_Z, p.B, cfg.m_prime)
     n_blk = K_comp.shape[1]
 
     with jax.named_scope("hca_qkv_proj"):
@@ -205,26 +205,26 @@ def _hca_forward_v2(
         K_swa_full = H @ p.W_swaK
 
     with jax.named_scope("hca_rope"):
-        cos_q, sin_q = ref._build_rope(n, cfg.rope_dim)
-        q = ref.apply_partial_rope(
+        cos_q, sin_q = eager._build_rope(n, cfg.rope_dim)
+        q = eager.apply_partial_rope(
             q, cos_q[None, :, None, :], sin_q[None, :, None, :], cfg.rope_dim,
         )
-        cos_k, sin_k = ref._build_rope(n_blk, cfg.rope_dim)
-        K_comp = ref.apply_partial_rope(
+        cos_k, sin_k = eager._build_rope(n_blk, cfg.rope_dim)
+        K_comp = eager.apply_partial_rope(
             K_comp, cos_k[None, :, :], sin_k[None, :, :], cfg.rope_dim,
         )
-        cos_s, sin_s = ref._build_rope(n, cfg.rope_dim)
-        K_swa_full = ref.apply_partial_rope(
+        cos_s, sin_s = eager._build_rope(n, cfg.rope_dim)
+        K_swa_full = eager.apply_partial_rope(
             K_swa_full, cos_s[None, :, :], sin_s[None, :, :], cfg.rope_dim,
         )
 
     with jax.named_scope("hca_swa_gather"):
-        K_swa = ref.swa_gather(K_swa_full, cfg.n_win)
+        K_swa = eager.swa_gather(K_swa_full, cfg.n_win)
 
     with jax.named_scope("hca_rmsnorm"):
-        q = ref.rms_norm(q)
-        K_comp = ref.rms_norm(K_comp)
-        K_swa = ref.rms_norm(K_swa)
+        q = eager.rms_norm(q)
+        K_comp = eager.rms_norm(K_comp)
+        K_swa = eager.rms_norm(K_swa)
 
     if n_blk > 4096:
         raise NotImplementedError(
@@ -375,7 +375,7 @@ def _sinkhorn_pallas(
 #
 #   (2) Comb sinkhorn iterations: Pallas. The 19-step row/col-normalize
 #       loop needs intermediate residuals to autodiff. Running ``jax.vjp``
-#       over a pure forward (mirroring ``reference.mhc_sinkhorn``'s scan)
+#       over a pure forward (mirroring ``eager.mhc_sinkhorn``'s scan)
 #       inside a Pallas kernel keeps those residuals in VMEM scratch.
 #
 #   (3) Affine outer step on comb (``comb_init = comb_raw · hc_scale[2] +
@@ -395,7 +395,7 @@ def _sinkhorn_pallas(
 def _sinkhorn_norm_pure(comb_init, *, sinkhorn_iters, eps):
     """Pure forward for the post-affine comb normalization path.
 
-    Mirrors ``reference.mhc_sinkhorn``'s scan-based iteration (NOT the
+    Mirrors ``eager.mhc_sinkhorn``'s scan-based iteration (NOT the
     Pallas forward's ``fori_loop`` — fori_loop is non-differentiable,
     while scan natively supports reverse-mode autodiff). The two paths
     are numerically identical for the same iteration count.
@@ -638,8 +638,8 @@ def _make_sinkhorn_kernel(config: KernelConfig, hc: int, sinkhorn_iters: int, ep
 
 def csa_forward_kernel_v2(
     H: jax.Array,
-    params: ref.CSAParams,
-    cfg: ref.CSAConfig,
+    params: eager.CSAParams,
+    cfg: eager.CSAConfig,
     *,
     config: KernelConfig | None = None,
 ) -> jax.Array:
@@ -660,8 +660,8 @@ def csa_forward_kernel_v2(
 
 def hca_forward_kernel_v2(
     H: jax.Array,
-    params: ref.HCAParams,
-    cfg: ref.HCAConfig,
+    params: eager.HCAParams,
+    cfg: eager.HCAConfig,
     *,
     config: KernelConfig | None = None,
 ) -> jax.Array:
@@ -689,7 +689,7 @@ def mhc_sinkhorn_kernel_v2(
     *,
     config: KernelConfig | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Pallas mHC Sinkhorn projection (matches ``reference.mhc_sinkhorn``).
+    """Pallas mHC Sinkhorn projection (matches ``eager.mhc_sinkhorn``).
 
     Forward keeps the hc×hc matrix in VMEM across the 19-iter loop;
     backward (see ``_mhc_sinkhorn_v2_bwd``) does the same for the

@@ -24,7 +24,7 @@ To set up a new experiment, work with the user to:
      forward, the scalar-prefetched block-sparse pattern (which is exactly
      what our top-k MQA needs), the four matmul-sharding cases, layout
      rules, and the footgun list.
-   - `dsv4/reference.py` — the eager-JAX reference. **Do not modify.** It is
+   - `dsv4/eager.py` — the eager-JAX reference. **Do not modify.** It is
      the ground-truth oracle.
    - `dsv4/kernel.py` — the file you modify. Surface contract documented at
      the top of the file. Replace the eager bodies with `@pl.pallas_call`
@@ -52,13 +52,13 @@ faster, and is graded by `bench.py`.
 - Set `XLA_FLAGS` for HLO dumps when profiling.
 
 **What you CANNOT do:**
-- Modify `dsv4/reference.py`. It is the oracle.
+- Modify `dsv4/eager.py`. It is the oracle.
 - Modify the public surface of `dsv4/kernel.py` (the function names, signatures,
   return dtypes/shapes). The bench script depends on them.
 - Loosen the correctness tolerance in `bench.py` to make a kernel "pass". If
   you need to relax tolerance for legitimate numeric reasons (e.g. bf16
   accumulation differences), justify it in the description column.
-- Change the FLOP counters in `reference.py` to inflate MFU.
+- Change the FLOP counters in `eager.py` to inflate MFU.
 - Install new packages outside what's in `pyproject.toml`. Pallas ships with
   `jax`; you should not need anything else.
 
@@ -198,7 +198,7 @@ HuggingFace repo), and consider:
 ```
 DeepSeek_V4.pdf      — spec (read-only)
 kernel_refs.md       — Pallas-TPU + sharding reference card (read first)
-dsv4/reference.py    — oracle (read-only)
+dsv4/eager.py        — oracle (read-only)
 dsv4/kernel.py       — agent edits this
 bench.py             — harness (extend, don't change defaults)
 program.md           — this file (don't edit)
