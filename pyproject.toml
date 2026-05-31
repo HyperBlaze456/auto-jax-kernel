@@ -3,14 +3,14 @@ name = "auto-jax-kernel"
 version = "0.1.0"
 description = "Autoresearch-style harness for a Pallas-TPU kernel implementing DeepSeek V4 hybrid attention (CSA / HCA / short SWA)."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "jax>=0.4.34",
-    "jaxlib>=0.4.34",
-    "numpy>=1.26",
+    "jax>=0.10.1",
+    "jaxlib>=0.10.1",
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
-tpu = ["jax[tpu]>=0.4.34"]
-cuda = ["jax[cuda12]>=0.4.34"]
+tpu = ["jax[tpu]>=0.10.1"]
+cuda = ["jax[cuda12]>=0.10.1"]
 dev = ["pytest>=8.0"]

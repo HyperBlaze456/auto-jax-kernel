@@ -43,8 +43,7 @@ URLs: `jax-ml.github.io/scaling-book/tpus`, `docs.jax.dev/.../pallas/tpu/hardwar
 | `pl.program_id(axis)` | Current grid coord |
 | `pl.num_programs(axis)` | Grid size on axis |
 | `pl.ds(start, size)` / `pl.dslice(...)` | Dynamic slice |
-| `pl.load(ref, idx, mask=, other=)` | Masked load (for ragged/oob) |
-| `pl.store(ref, idx, value, mask=)` | Masked store |
+| `ref[idx]` → load, `ref[idx] = v` → store | Ref indexing (bare `pl.load`/`pl.store` were removed; mask ragged/oob with `jnp.where`) |
 | `pl.when(cond)` | Conditional block (decorates a `def _():`) |
 | `pltpu.PrefetchScalarGridSpec(num_scalar_prefetch, grid, in_specs, out_specs, scratch_shapes)` | Grid that passes scalar arrays to index_map |
 | `pltpu.VMEM(shape, dtype)` / `pltpu.SMEM(...)` | Explicit scratch in a memory space |
@@ -85,8 +84,8 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
 # In a BlockSpec, you pick the memory space the block lives in:
-pl.BlockSpec(shape, index_map, memory_space=pltpu.VMEM)        # default
-pl.BlockSpec(shape, index_map, memory_space=pltpu.ANY)         # leaves in HBM
+pl.BlockSpec(shape, index_map, memory_space=pltpu.MemorySpace.VMEM)   # default
+pl.BlockSpec(shape, index_map, memory_space=pl.ANY)                   # leaves in HBM (pltpu.ANY removed; use pl.ANY or pltpu.MemorySpace.HBM)
 # scratch (persistent across grid iterations):
 scratch_shapes=[pltpu.VMEM((bm, bn), jnp.float32),
                 pltpu.SMEM((1024,), jnp.int32)]
@@ -621,5 +620,6 @@ the ceiling, fix by raising arithmetic intensity).
 
 ---
 
-*Updated: 2026-05-09. Source URLs are fingerprintable; if a doc has moved
-upstream, search `docs.jax.dev` for the section title.*
+*Updated: 2026-06-01 (API surface re-checked against jax/jaxlib 0.10.1).
+Source URLs are fingerprintable; if a doc has moved upstream, search
+`docs.jax.dev` for the section title.*
