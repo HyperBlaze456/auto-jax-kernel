@@ -120,10 +120,11 @@ TPU_SPECS: dict[str, TpuSpec] = {
     "v6e": TpuSpec("v6e", vmem_bytes=32 * MiB, num_cores=1),
     "v6p": TpuSpec("v6p", vmem_bytes=64 * MiB, num_cores=2),
     # Dev fallback for CPU / unknown backends. ``lane_size=1`` disables
-    # the VPU-alignment requirement so tiny dev shapes (e.g. SMALL_CSA
-    # with c=64) trace through pallas_call(interpret=True) without
-    # tripping the multiple-of-128 check. VMEM is generous because
-    # interpret mode doesn't actually allocate VMEM.
+    # the VPU-alignment requirement so a sub-128 head dim ``c`` traces
+    # through pallas_call(interpret=True) without tripping the
+    # multiple-of-128 check. (The SMALL_* presets keep c=128 so they stay
+    # valid on real TPU too, but this keeps the dev path tolerant of any
+    # tiny shape.) VMEM is generous because interpret mode doesn't allocate.
     "cpu": TpuSpec("cpu", vmem_bytes=128 * MiB, num_cores=1, lane_size=1),
 }
 

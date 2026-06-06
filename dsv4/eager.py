@@ -595,11 +595,16 @@ DSV4_PRO_CSA = CSAConfig(
 DSV4_PRO_HCA = HCAConfig(
     d=7168, c=512, n_h=128, m_prime=128, n_win=128, d_c=1536,
 )
-# Small preset for CPU/dev. Same algorithmic surface, tiny dims.
+# Small preset for CPU/dev. Same algorithmic surface, tiny dims. The MQA head
+# dim ``c`` is kept at 128 (== the v5e/v6 lane width) so these presets are a
+# valid TPU sanity shape too — the Pallas flash kernel requires ``c`` to be a
+# multiple of ``lane_size`` (see kernel_config.config_for). The query-path
+# low-rank dim ``d_c`` and indexer head dim ``c_I`` stay sub-128: they only
+# feed plain-JAX GEMMs / top-k, never the lane-aligned Pallas kernel.
 SMALL_CSA = CSAConfig(
-    d=128, c=64, n_h=4, m=4, topk=8, n_win=16,
+    d=128, c=128, n_h=4, m=4, topk=8, n_win=16,
     d_c=64, n_I_h=4, c_I=32,
 )
 SMALL_HCA = HCAConfig(
-    d=128, c=64, n_h=4, m_prime=16, n_win=16, d_c=64,
+    d=128, c=128, n_h=4, m_prime=16, n_win=16, d_c=64,
 )

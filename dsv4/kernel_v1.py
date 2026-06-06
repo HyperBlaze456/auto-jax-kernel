@@ -116,6 +116,31 @@ from .kernel_config import KernelConfig, default_config
 _NEG_INF_F32 = -1.0e30
 
 
+def _dot2(lhs, rhs, *, contract):
+    """``dot_general`` over operands whose first TWO axes are batch dims.
+
+    Pallas lowers ``dot_general`` through Mosaic to ``tpu.matmul``, which only
+    supports a *single* batch dimension — declaring two (here ``(b, t)``)
+    raises ``'tpu.matmul' op Not implemented: Up to 1 batch dim supported``.
+    Both operands are shaped ``[b, t, ...]`` batched over ``(b, t)``, so we
+    fold the two batch axes into one (``b*t``) for the matmul and unfold the
+    result. The in-kernel block always has ``b == 1``, so this fold only
+    rearranges leading (non-tiled) axes and is layout-free.
+
+    ``contract`` is ``(lhs_axis, rhs_axis)`` in the ORIGINAL (un-folded) axis
+    numbering, i.e. each is ``>= 2``.
+    """
+    lc, rc = contract
+    b0, b1 = lhs.shape[0], lhs.shape[1]
+    out = jax.lax.dot_general(
+        lhs.reshape((b0 * b1,) + lhs.shape[2:]),
+        rhs.reshape((b0 * b1,) + rhs.shape[2:]),
+        dimension_numbers=(((lc - 1,), (rc - 1,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    )
+    return out.reshape((b0, b1) + out.shape[1:])
+
+
 # ---------------------------------------------------------------------------
 # Pallas kernel: FlashAttention forward with per-head attention sink
 # ---------------------------------------------------------------------------
@@ -148,11 +173,7 @@ def _flash_sink_kernel(
 
     # Per-(b, t) MQA QK^T. Contract over c, batch over (b, t).
     # q: [1, BQ, n_h, c]  ·  k: [1, BQ, BS, c]  →  logits: [1, BQ, n_h, BS]
-    logits = jax.lax.dot_general(
-        q, k,
-        dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    ) * jnp.float32(scale)
+    logits = _dot2(q, k, contract=(3, 3)) * jnp.float32(scale)
 
     mask_b = mask[:, :, None, :]                                     # [1, BQ, 1, BS]
     logits = jnp.where(mask_b, logits, jnp.float32(_NEG_INF_F32))
@@ -172,11 +193,7 @@ def _flash_sink_kernel(
     l_new = alpha * l_prev + jnp.sum(p, axis=-1, keepdims=True)
 
     # PV. p: [1, BQ, n_h, BS]  ·  k (=v): [1, BQ, BS, c]  →  [1, BQ, n_h, c].
-    pv = jax.lax.dot_general(
-        p, k,
-        dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    )
+    pv = _dot2(p, k, contract=(3, 2))
     acc_new = acc_prev * alpha + pv
 
     # Persist running state. m_new / l_new broadcast over the c lane axis.
@@ -326,22 +343,14 @@ def _flash_sink_kernel_bwd(
     dout = dout_ref[...].astype(jnp.float32)  # [1, BQ, n_h, c]
 
     # Recompute attention weights p from the saved lse.
-    logits = jax.lax.dot_general(
-        q, k,
-        dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    ) * jnp.float32(scale)                                    # [1, BQ, n_h, BS]
+    logits = _dot2(q, k, contract=(3, 3)) * jnp.float32(scale)   # [1, BQ, n_h, BS]
 
     mask_b = mask[:, :, None, :]                              # [1, BQ, 1, BS]
     p = jnp.exp(logits - lse)                                 # [1, BQ, n_h, BS]
     p = jnp.where(mask_b, p, jnp.float32(0.0))
 
     # dp[b,t,h,s] = Σ_c dout[b,t,h,c] · k[b,t,s,c]    (same contraction as fwd QK^T)
-    dp = jax.lax.dot_general(
-        dout, k,
-        dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    )                                                          # [1, BQ, n_h, BS]
+    dp = _dot2(dout, k, contract=(3, 3))                         # [1, BQ, n_h, BS]
 
     # Standard softmax-bwd identity. Masked positions stay 0 because p is
     # zeroed for them, which propagates through the multiply.
@@ -349,24 +358,12 @@ def _flash_sink_kernel_bwd(
 
     # dq contribution from this s-tile.
     # dlogits: [..., n_h, BS] · k: [..., BS, c] → [..., n_h, c]
-    dq_contrib = jax.lax.dot_general(
-        dlogits, k,
-        dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    ) * jnp.float32(scale)                                     # [1, BQ, n_h, c]
+    dq_contrib = _dot2(dlogits, k, contract=(3, 2)) * jnp.float32(scale)  # [1, BQ, n_h, c]
     dq_scratch_ref[...] = dq_scratch_ref[...] + dq_contrib
 
     # dk per-tile, QK + PV. Both contract over n_h (dim 2 in both operands).
-    dk_qk = jax.lax.dot_general(
-        dlogits, q,
-        dimension_numbers=(((2,), (2,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    ) * jnp.float32(scale)                                     # [1, BQ, BS, c]
-    dk_pv = jax.lax.dot_general(
-        p, dout,
-        dimension_numbers=(((2,), (2,)), ((0, 1), (0, 1))),
-        preferred_element_type=jnp.float32,
-    )                                                          # [1, BQ, BS, c]
+    dk_qk = _dot2(dlogits, q, contract=(2, 2)) * jnp.float32(scale)  # [1, BQ, BS, c]
+    dk_pv = _dot2(p, dout, contract=(2, 2))                          # [1, BQ, BS, c]
     dk_ref[...] = (dk_qk + dk_pv).astype(dk_ref.dtype)
 
     @pl.when(s == nsteps - 1)
