@@ -162,11 +162,59 @@ selection orders match.
   RMSNorm'd flattened stream (the "output dim 24" GEMM). Swap for
   checkpoint-specific readouts when real weights exist.
 
-## 8. Future work, in value order
+## 8. Backward pass (training) — `*_diff.py` / `attention_train.py`
+
+Precision policy: fp8 forward, **bf16 gradients with fp32 accumulation**
+(DSv3 recipe), STE through every quantization point. Test oracles encode
+the identical STE, so agreement bounds (≲1% rel) reflect only the bf16
+gradient policy. All backwards are bitwise deterministic (asserted).
+
+### Expert FFN (`gemm_fp8_diff.grouped_ffn`)
+One custom_vjp unit spans Linear-1 + SwiGLU + fp8 cast + Linear-2.
+Residuals are **only the two fp8 payloads the forward made anyway**
+(x_q, h_q ≈ 1.13 B/elem) — gate/up are *recomputed* in the backward from
+x_q·W13 (the FlashAttention recompute trade applied to the FFN; vs
+~12 B/elem for a naive bf16 checkpoint of x, gate, up, h). Dataflow:
+dh = dgrad(dy, W2); dW2 = tgmm(deq(h_q)ᵀ, dy); d13 = swiglu_bwd(x_q, W13,
+dh); dx = dgrad(d13, W13); dW13 = tgmm(deq(x_q)ᵀ, d13). The dgrad kernel
+mirrors the forward's layout rules with a transposed lane-broadcast scale
+table (`s_bcast_t[E, N/128, 1, K]`); wgrad reuses megablox `tgmm` (vetted)
+in bf16/fp32. **Pitfall encoded in a test**: the wgrad operand is the
+*dequantized fp8 x* (the tensor the forward actually multiplied), not the
+master x — using the master injects the act-quant error into dW
+(observed: 3.6% → 0.46% on dW13 after the fix).
+
+### Gather attention (`attention_train`)
+Training keeps KV in bf16 (cache quantization is serving-only), which
+removes the nope/rope split. Forward additionally emits lse — the only
+attention residual; K_full never exists in either direction. Backward
+**re-gathers** the same rows (second pass over the minimal byte set),
+recomputes p from lse, accumulates dq in-register, and writes per-token
+dK contribution rows; an XLA scatter-add then reduces them — the paper
+§3.3 shape (one producer per contribution + fixed-order reduction), no
+atomics. Bwd HBM: re-gather reads + one contribution-buffer round trip
+(a sort-by-destination two-pass would remove the round trip; documented,
+not built). dsink is closed-form in XLA.
+
+### mHC (`mhc_diff`)
+Closed-form fused Pallas backwards (RMSNorm backprop + the hc x hc
+adjoints), one HBM pass each, exact to f32 ulp vs jax.grad oracles.
+
+### MoE (`moe_diff`)
+Only the FFN is a custom_vjp; routing (Sqrt(Softplus) affinity, gate
+normalization), permute, and segment-sum combine are plain jnp that JAX
+autodiffs (gather-bwd = deterministic scatter-add). The aux-loss-free
+router bias is selection-only (`stop_gradient`) and carries zero grad —
+asserted. EP training: JAX autodiffs `shard_map`+`all_to_all` natively
+(combine-bwd is a dispatch-shaped a2a); wiring deferred.
+
+## 9. Future work, in value order
 
 1. Pallas EP mega-kernel (remote-DMA waves fused with grouped GEMM).
 2. Page-aligned indexer selection → bandwidth-optimal gather DMAs.
 3. Prefill q-block gather batching (splash-style top-k union).
-4. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
-5. Backward pass (training): the forward already saves nothing it
-   shouldn't; lse outputs can be re-enabled in the gather kernel.
+4. Sort-by-destination two-pass dK reduction (kills the contribution
+   buffer round trip in attention bwd).
+5. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
+6. Full-model training step (compose attention_train + moe_diff +
+   mhc_diff through the layer stack; all sublayer grads exist).
