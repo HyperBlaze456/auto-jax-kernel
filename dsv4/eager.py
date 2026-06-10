@@ -245,10 +245,14 @@ def topk_indices(scores: jax.Array, k: int) -> jax.Array:
     """
     B, n, n_blk = scores.shape
     if k >= n_blk:
-        # Pad with -1 to maintain shape contract. Caller masks via valid scores.
-        idx = jnp.broadcast_to(jnp.arange(n_blk), (B, n, n_blk))
+        # Select every block, but mask causally-invalid (-inf-scored) ones
+        # to -1 — same contract as the top_k branch below. (An earlier
+        # version skipped this mask, silently making short-sequence runs
+        # with k >= n_blk attend *future* blocks.)
+        idx = jnp.broadcast_to(jnp.arange(n_blk), (B, n, n_blk)).astype(jnp.int32)
+        idx = jnp.where(jnp.isfinite(scores), idx, -1)
         pad = jnp.full((B, n, k - n_blk), -1, dtype=jnp.int32)
-        return jnp.concatenate([idx.astype(jnp.int32), pad], axis=-1)
+        return jnp.concatenate([idx, pad], axis=-1)
     # jnp.argsort is stable; take last k.
     _, idx = jax.lax.top_k(scores, k)
     # Mask invalid (would-be-selected -inf) to -1
