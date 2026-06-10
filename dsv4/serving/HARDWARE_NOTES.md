@@ -208,6 +208,22 @@ router bias is selection-only (`stop_gradient`) and carries zero grad —
 asserted. EP training: JAX autodiffs `shard_map`+`all_to_all` natively
 (combine-bwd is a dispatch-shaped a2a); wiring deferred.
 
+### Full training step (`train_step`)
+`train_step(params, tokens, cfg) → (loss, grads)` composes every diffable
+unit through the whole layer schedule under per-layer `jax.checkpoint`
+(activation memory = one layer's working set; the custom-vjp units'
+fp8/lse residuals are recomputed under remat, not stored). Gradients
+reach every trainable leaf — compressor weights arrive via dK_comp
+flowing back through rms_norm→RoPE→compressor — with two principled
+zero-grad exceptions (router_bias: bias-controller-updated; indexer
+params: trained by score distillation per paper §2.3.1, not the LM loss
+— hook documented, not built). `to_serving_params` quantizes the trained
+masters into the serving format, closing the QAT train→serve loop;
+asserted by serving a trained tree through `model.prefill`. Conventions
+match serving (completed-blocks-only compression), so what trains is
+what serves. KV stays bf16 in training (cache quantization is a
+serving-time decision).
+
 ## 9. Future work, in value order
 
 1. Pallas EP mega-kernel (remote-DMA waves fused with grouped GEMM).
@@ -216,5 +232,7 @@ asserted. EP training: JAX autodiffs `shard_map`+`all_to_all` natively
 4. Sort-by-destination two-pass dK reduction (kills the contribution
    buffer round trip in attention bwd).
 5. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
-6. Full-model training step (compose attention_train + moe_diff +
-   mhc_diff through the layer stack; all sublayer grads exist).
+6. Indexer score-distillation objective (paper §2.3.1) so indexer
+   params train; today they are principled zero-grad under the LM loss.
+7. EP training wiring (shard_map a2a autodiffs natively; substitute
+   grouped_ffn into moe_forward_ep when multi-host training lands).

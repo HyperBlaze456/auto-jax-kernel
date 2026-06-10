@@ -17,6 +17,8 @@ Training (backward) counterparts:
                    with deterministic scatter-add dK reduction
   mhc_diff       — closed-form fused Pallas backwards for the mHC ops
   moe_diff       — jax.grad-able MoE layer (custom_vjp only on the FFN)
+  train_step     — full-model (loss, grads) step with per-layer remat;
+                   to_serving_params closes the QAT train→serve loop
 
 See HARDWARE_NOTES.md for the byte-accounting design rationale (§8 for
 the backward pass).
