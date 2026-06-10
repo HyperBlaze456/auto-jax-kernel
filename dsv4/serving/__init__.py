@@ -8,6 +8,10 @@ Modules:
   moe            — routing, EP dispatch/combine, wave overlap
   mhc            — fused hyper-connection residual ops (Pallas)
   model          — full-stack prefill / decode_step
+  attention_paged— page-aligned selection + paged gather kernel (one DMA
+                   per P-entry page; descriptor-bound → bandwidth-bound)
+  moe_megakernel — fused dispatch/expert-GEMM/combine remote-DMA wave
+                   pipeline (one Pallas kernel per shard; MegaMoE on TPU)
 
 Training (backward) counterparts:
   gemm_fp8_diff  — diffable grouped expert FFN (fp8 fwd, bf16 bwd, fp8

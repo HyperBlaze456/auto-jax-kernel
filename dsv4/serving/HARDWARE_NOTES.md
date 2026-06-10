@@ -224,15 +224,70 @@ match serving (completed-blocks-only compression), so what trains is
 what serves. KV stays bf16 in training (cache quantization is a
 serving-time decision).
 
-## 9. Future work, in value order
+## 9. EP mega-kernel (`moe_megakernel.py`) — DONE (v1)
 
-1. Pallas EP mega-kernel (remote-DMA waves fused with grouped GEMM).
-2. Page-aligned indexer selection → bandwidth-optimal gather DMAs.
-3. Prefill q-block gather batching (splash-style top-k union).
-4. Sort-by-destination two-pass dK reduction (kills the contribution
+The MegaMoE idea (paper §3.1 Fig. 5c) as ONE Pallas kernel per shard:
+remote-DMA dispatch of wave w+1 runs on the DMA engines while wave w's
+expert GEMMs run on the MXU, and each expert's results are remote-copied
+back the moment that expert finishes. The overlap is *structural*
+(instruction order + semaphores inside one kernel), not scheduler-found —
+that continuity of ICI traffic across op boundaries is where the paper's
+1.4→1.9× headroom lives. ICI bytes are unchanged vs the wave graph
+(already minimal: fp8 dispatch + bf16 combine).
+
+What makes it tractable on TPU: **expert-major static capacity buckets**
+(`pack_dispatch`, host XLA). Every (wave, dst-shard, expert) lane has
+fixed `cap_e` slots, so every DMA extent, GEMM tile, and BlockSpec index
+is a static function of grid coordinates — no in-kernel sort, no group
+metadata, no scalar prefetch. The price is zero-padded slots (the
+standard TPU capacity trade). Pair ids never travel: `y_back[w,dst,e,c]`
+positionally IS the result of send slot `[w,dst,e,c]`.
+
+Semaphore protocol (the deadlock trap, now encoded in the code + tests):
+a START descriptor's recv_sem is an address resolved on the
+*destination*, so the sender must name slot `my_id` (landing on the
+destination's `recv_sem[sender]`); WAIT descriptors run locally and name
+slot `src`. Dispatch sems are parity-indexed `(2, ep)` because waves w
+and w+1 are concurrently in flight with same-shape descriptors. Combine
+drains by descriptor at the last grid step (order-insensitive: equal-size
+slabs, byte-counting semaphores).
+
+Verified on 2- and 4-shard interpret meshes (`InterpretParams`) against
+a dense oracle (≲0.3% rel = fp8 quant points only), bitwise
+deterministic, including fully-skewed hot-shard routing. v1 scoping:
+expert weights arrive as whole `(d, 2dff)` BlockSpec tiles (bf16,
+dequantized at load) — Pro-scale weights need the inner k-loop refactor
++ fp8-block-scaled in-kernel GEMM before TPU deploy; recv/stage buffers
+are ANY-space HBM (direct stores to ANY refs are illegal — stage via
+VMEM + `make_async_copy`).
+
+## 10. Page-aligned gathers (`attention_paged.py`) — DONE
+
+The row-gather kernel is descriptor-issue-bound, not bandwidth-bound:
+3·k descriptors/token of 448–1024 B each. Constraining the indexer to
+pages of P consecutive entries (FlashMLA's paged KV applied to
+*selection*) moves one contiguous `P·row_bytes` slab per descriptor
+(P=8 → ~4.6 KB, the DMA engine's efficient regime) and cuts descriptors
+P× (k=512: 1536 → 192/token). Page score = max of row scores (one strong
+row pulls in its page); causality is enforced in-kernel via a per-token
+row bound (pages may straddle the boundary). The paged kernel is
+**bit-exact** vs the verified row kernel on expanded indices with matched
+accumulation grouping — pages isolated as the only variable. Selection
+coarsening is the quality knob: `page_recall` measures overlap vs
+row-top-k (~0.8 on uncorrelated random scores = structural worst case;
+real indexer scores correlate within pages).
+
+## 11. Future work, in value order
+
+1. Mega-kernel k-loop refactor: fp8-block-scaled in-kernel expert GEMM
+   (gmm-style two-level accum) + tiled weights for Pro shapes.
+2. Prefill q-block gather batching (splash-style top-k union).
+3. Sort-by-destination two-pass dK reduction (kills the contribution
    buffer round trip in attention bwd).
-5. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
-6. Indexer score-distillation objective (paper §2.3.1) so indexer
+4. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
+5. Indexer score-distillation objective (paper §2.3.1) so indexer
    params train; today they are principled zero-grad under the LM loss.
-7. EP training wiring (shard_map a2a autodiffs natively; substitute
+6. EP training wiring (shard_map a2a autodiffs natively; substitute
    grouped_ffn into moe_forward_ep when multi-host training lands).
+7. Wire paged selection into model.py as a serving config knob
+   (kernel + selection exist; default stays row-exact).
