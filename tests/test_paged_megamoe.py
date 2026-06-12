@@ -176,9 +176,11 @@ def test_bucket_reference_vs_dense_oracle(bucket_setup):
 # ---------------------------------------------------------------------------
 
 
-def _mega_run(EP, NW, E_WL, CAP, seed=80, skew=False):
+def _mega_run(EP, NW, E_WL, CAP, seed=80, skew=False, d=256, dff=256):
+    from dsv4.serving import gemm_fp8
+
     ks = jax.random.split(jax.random.PRNGKey(seed), 8)
-    M_per, d, dff, topk = 8, 256, 256, 2
+    M_per, topk = 8, 2
     E = EP * NW * E_WL
     cfg = MoEConfig(n_routed=E, d_expert=dff, topk=topk)
     M = M_per * EP
@@ -191,37 +193,45 @@ def _mega_run(EP, NW, E_WL, CAP, seed=80, skew=False):
         idx = jax.random.randint(ks[3], (M, topk), 0, E).astype(jnp.int32)
     gates = jax.nn.softmax(jax.random.normal(ks[4], (M, topk), jnp.float32), -1)
 
+    w13q = quant.quantize_weight(w13)
+    w2q = quant.quantize_weight(w2)
+    gw13 = gemm_fp8.prepare_weight(w13q)
+    gw2 = gemm_fp8.prepare_weight(w2q)
+
     mesh = jax.make_mesh((EP,), ("ep",))
     P = jax.sharding.PartitionSpec
 
     def NS(s):
         return jax.sharding.NamedSharding(mesh, s)
 
-    def shard_body(x_l, idx_l, gates_l, w13_l, w2_l):
+    def shard_body(x_l, idx_l, gates_l, w13q_l, w13s_l, w2q_l, w2s_l):
         b = mk.pack_dispatch(x_l, idx_l, gates_l, cfg,
                              ep_size=EP, n_waves=NW, cap_e=CAP)
-        return mk.mega_moe_shard(b, w13_l, w2_l, x_l.shape[0],
-                                 axis_name="ep", ep_size=EP, n_waves=NW)
+        return mk.mega_moe_shard(
+            b, gemm_fp8.GemmWeight(w13q_l, w13s_l),
+            gemm_fp8.GemmWeight(w2q_l, w2s_l), x_l.shape[0],
+            axis_name="ep", ep_size=EP, n_waves=NW)
 
     fn = jax.shard_map(shard_body, mesh=mesh,
-                       in_specs=(P("ep"),) * 5, out_specs=P("ep"),
+                       in_specs=(P("ep"),) * 7, out_specs=P("ep"),
                        check_vma=False)
     args = tuple(jax.device_put(a, NS(P("ep")))
-                 for a in (x, idx, gates, w13, w2))
+                 for a in (x, idx, gates, gw13.q, gw13.s_bcast,
+                           gw2.q, gw2.s_bcast))
     out = jnp.asarray(jax.device_get(fn(*args)))
 
+    # Dense oracle on the SAME quant points (fp8 x, fp8 weights, fp8 hidden).
     xd = quant.dequantize_act(quant.quantize_act(x))
-    w13b = w13.astype(jnp.bfloat16).astype(jnp.float32)
-    w2b = w2.astype(jnp.bfloat16).astype(jnp.float32)
+    w13d = quant.dequantize_weight(w13q)
+    w2d = quant.dequantize_weight(w2q)
     ref = jnp.zeros((M, d), jnp.float32)
     for j in range(topk):
         for g in range(E):
             sel = idx[:, j] == g
-            h13 = xd.astype(jnp.bfloat16).astype(jnp.float32) @ w13b[g]
+            h13 = xd @ w13d[g]
             h = (h13[:, :dff] * jax.nn.sigmoid(h13[:, :dff])) * h13[:, dff:]
-            hd = quant.dequantize_act(
-                quant.quantize_act(h)).astype(jnp.bfloat16).astype(jnp.float32)
-            ref += jnp.where(sel[:, None], gates[:, j:j + 1] * (hd @ w2b[g]), 0.0)
+            hd = quant.dequantize_act(quant.quantize_act(h))
+            ref += jnp.where(sel[:, None], gates[:, j:j + 1] * (hd @ w2d[g]), 0.0)
     return out, ref, fn, args
 
 
@@ -252,5 +262,16 @@ def test_megakernel_skewed_routing():
     """All pairs target shard 0's experts: exercises hot-shard recv
     pressure + empty buckets everywhere else (capacity sized to fit)."""
     out, ref, _, _ = _mega_run(EP=2, NW=2, E_WL=2, CAP=16, seed=82, skew=True)
+    err = float(jnp.abs(out - ref).max())
+    assert err / float(jnp.abs(ref).max()) < 3e-2
+
+
+@needs_devices
+def test_megakernel_asymmetric_kphases():
+    """d != dff exercises unequal GEMM1/GEMM2 phase lengths on the k grid
+    axis (nk1=4, nhk=3) — the clamped weight index_maps and the phase
+    boundary must line up exactly."""
+    out, ref, _, _ = _mega_run(EP=2, NW=2, E_WL=2, CAP=8, seed=83,
+                               d=512, dff=384)
     err = float(jnp.abs(out - ref).max())
     assert err / float(jnp.abs(ref).max()) < 3e-2

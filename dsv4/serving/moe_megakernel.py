@@ -57,11 +57,15 @@ Semaphore accounting (SPMD-symmetric, per kernel_refs §F):
   - A collective barrier brackets the kernel (``get_barrier_semaphore``)
     so no shard's sends race a neighbor still in its previous layer.
 
-VMEM (v1 scoping): per-expert weight blocks arrive whole via BlockSpec
-((1, d, 2dff) fp8). Fine for tests and small dffs; Pro-scale weights
-(16 MiB/expert) need the inner k-loop refactor documented in
-HARDWARE_NOTES §9 before TPU deploy. Everything else (recv tiles,
-accumulators) is a few hundred KB.
+VMEM: the third grid axis steps both GEMM contractions in 128-row quant
+blocks (phase 1: k < d/128 over W13; phase 2: over W2), so per-step VMEM
+holds one (QBLOCK, N) weight tile (~0.75 MiB fp8 at Pro shapes), never a
+whole expert — Pro's 42 MiB/expert W13 streams through any generation's
+VMEM. The in-kernel math is gmm_fp8's two-level accumulation verbatim
+(bf16-upcast fp8 dot → f32 partial → × row·col scales per quant block →
+f32 master accumulator), with the SwiGLU + fp8 hidden re-quant executed
+in-register at the phase boundary. Total resident scratch at Pro shapes
+(rows=64): accumulators + fp8 x/h + staging ≈ 5 MiB.
 
 The fallback ``mega_moe_reference`` runs the identical bucket layout
 through plain jnp — it is both the correctness oracle and the
@@ -245,6 +249,7 @@ import jax.experimental.pallas as pl  # noqa: E402
 import jax.experimental.pallas.tpu as pltpu  # noqa: E402
 
 from .config import FP8_MAX  # noqa: E402
+from .gemm_fp8 import GemmWeight  # noqa: E402
 
 _EPSQ = 1e-12
 
@@ -253,8 +258,11 @@ def _mega_kernel(
     # inputs
     send_q_hbm,    # ANY [n_waves, ep, e_wl, cap_e, d]    e4m3  my dispatch payloads
     send_s_hbm,    # ANY [n_waves, ep, e_wl, cap_e, nsk]  f32
-    w13_ref,       # [1, d, 2dff] bf16   (this (wave, e)'s expert, via BlockSpec)
-    w2_ref,        # [1, dff, d]  bf16
+    w13_q_ref,     # [1, QBLOCK, 2dff] e4m3  (k-th quant-block row tile of
+                   #  this (wave, e)'s expert W13, streamed via BlockSpec)
+    w13_s_ref,     # [1, 1, 1, 2dff]  f32    (lane-broadcast scales, k-th block)
+    w2_q_ref,      # [1, QBLOCK, d]   e4m3   (W2's (k - nk1)-th block tile)
+    w2_s_ref,      # [1, 1, 1, d]     f32
     # outputs
     recv_q_hbm,    # ANY [n_waves, ep, e_wl, cap_e, d]    e4m3  dispatch landing
     recv_s_hbm,    # ANY [n_waves, ep, e_wl, cap_e, nsk]  f32
@@ -263,6 +271,10 @@ def _mega_kernel(
     # scratch
     xq_vmem,       # [ep * cap_e, d]    e4m3
     xs_vmem,       # [ep * cap_e, nsk]  f32
+    hq_vmem,       # [ep * cap_e, dff]  e4m3  (fp8 hidden between the GEMMs)
+    hs_vmem,       # [ep * cap_e, nhk]  f32
+    acc1_vmem,     # [ep * cap_e, 2dff] f32   GEMM1 accumulator
+    acc2_vmem,     # [ep * cap_e, d]    f32   GEMM2 accumulator
     y_vmem,        # [ep * cap_e, d]    bf16
     disp_send_sem,  # DMA (2, ep)
     disp_recv_sem,  # DMA (2, ep)
@@ -281,6 +293,9 @@ def _mega_kernel(
 ):
     w = pl.program_id(0)
     e = pl.program_id(1)
+    k = pl.program_id(2)
+    nk1 = nsk                 # GEMM1 contraction steps (d / QBLOCK)
+    nhk = dff // QBLOCK       # GEMM2 contraction steps (dff / QBLOCK)
     my_id = jax.lax.axis_index(axis_name)
 
     def disp_ops(wv, *, for_start: bool):
@@ -312,7 +327,7 @@ def _mega_kernel(
         return ops
 
     # ---- wave-pipelined dispatch: send w+1 while computing w ----
-    @pl.when(e == 0)
+    @pl.when(jnp.logical_and(e == 0, k == 0))
     def _dispatch():
         @pl.when(w == 0)
         def _warmup():
@@ -329,69 +344,101 @@ def _mega_kernel(
         for op in disp_ops(w, for_start=False):
             op.wait()
 
-    # ---- load this expert's received rows (local HBM→VMEM copies) ----
-    loads = []
-    for src in range(ep):
-        loads.append(pltpu.make_async_copy(
-            recv_q_hbm.at[w, src, e],
-            xq_vmem.at[pl.ds(src * cap_e, cap_e)], load_sem))
-        loads.append(pltpu.make_async_copy(
-            recv_s_hbm.at[w, src, e],
-            xs_vmem.at[pl.ds(src * cap_e, cap_e)], load_sem))
-    for op in loads:
-        op.start()
-    for op in loads:
-        op.wait()
+    # ---- load this expert's received rows once per (w, e) ----
+    @pl.when(k == 0)
+    def _load_rows():
+        loads = []
+        for src in range(ep):
+            loads.append(pltpu.make_async_copy(
+                recv_q_hbm.at[w, src, e],
+                xq_vmem.at[pl.ds(src * cap_e, cap_e)], load_sem))
+            loads.append(pltpu.make_async_copy(
+                recv_s_hbm.at[w, src, e],
+                xs_vmem.at[pl.ds(src * cap_e, cap_e)], load_sem))
+        for op in loads:
+            op.start()
+        for op in loads:
+            op.wait()
+        acc1_vmem[...] = jnp.zeros_like(acc1_vmem)
+        acc2_vmem[...] = jnp.zeros_like(acc2_vmem)
 
-    # ---- expert FFN over [ep*cap_e, d] rows (fp32 accum throughout) ----
     rows = ep * cap_e
-    x_deq = (xq_vmem[...].astype(jnp.float32).reshape(rows, nsk, QBLOCK)
-             * xs_vmem[...][..., None]).reshape(rows, d).astype(jnp.bfloat16)
-    h13 = jax.lax.dot_general(
-        x_deq, w13_ref[0], (((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32)                # [rows, 2dff]
-    g, u = h13[:, :dff], h13[:, dff:]
-    h = (g * jax.nn.sigmoid(g)) * u                        # f32 [rows, dff]
-    # fp8 hidden re-quant (matches the serving gmm epilogue's quant point).
-    nhk = dff // QBLOCK
-    h3 = h.reshape(rows, nhk, QBLOCK)
-    hs = jnp.maximum(jnp.max(jnp.abs(h3), axis=-1), _EPSQ) / FP8_MAX
-    h_deq = ((jnp.clip(h3 / hs[..., None], -FP8_MAX, FP8_MAX)
-              .astype(jnp.float8_e4m3fn).astype(jnp.float32))
-             * hs[..., None]).reshape(rows, dff).astype(jnp.bfloat16)
-    y = jax.lax.dot_general(
-        h_deq, w2_ref[0], (((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32)                # [rows, d]
-    # ANY-space refs can't be stored to directly — stage via VMEM + DMA.
-    y_vmem[...] = y.astype(jnp.bfloat16)
-    stores = [
-        pltpu.make_async_copy(
-            y_vmem.at[pl.ds(r * cap_e, cap_e)],
-            stage_hbm.at[w, r, e], load_sem)
-        for r in range(ep)
-    ]
-    for op in stores:
-        op.start()
-    for op in stores:
-        op.wait()
 
-    # ---- per-expert eager combine: results return the moment e is done.
-    # Same slot convention as dispatch: starts signal the destination's
-    # comb_recv_sem[my_id]; the drain waits slot r per source shard.
-    for r in range(ep):
-        pltpu.make_async_remote_copy(
-            stage_hbm.at[w, r, e],
-            y_back_hbm.at[w, my_id, e],
-            comb_send_sem.at[r],
-            comb_recv_sem.at[my_id],
-            device_id=(r,),
-            device_id_type=pl.DeviceIdType.MESH,
-        ).start()
+    # ---- phase 1 (k < nk1): GEMM1 over W13's k-th 128-row quant block.
+    # Exactly gmm_fp8's two-level accumulation: bf16-upcast fp8 dot →
+    # fp32 partial → × (row scale · lane-broadcast col scale) → master acc.
+    @pl.when(k < nk1)
+    def _gemm1_step():
+        xq = jax.lax.dynamic_slice(
+            xq_vmem[...], (0, k * QBLOCK), (rows, QBLOCK))
+        xs = jax.lax.dynamic_slice(xs_vmem[...], (0, k), (rows, 1))
+        # None-squeezed BlockSpec leading dims: refs are already [128, N].
+        part = jax.lax.dot_general(
+            xq.astype(jnp.bfloat16), w13_q_ref[...].astype(jnp.bfloat16),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32)            # [rows, 2dff]
+        acc1_vmem[...] += part * xs * w13_s_ref[...].reshape(1, 2 * dff)
+
+    # ---- phase boundary: SwiGLU + fp8 re-quant of the hidden, persisted
+    # to scratch so phase 2's steps slice it block by block.
+    @pl.when(k == nk1 - 1)
+    def _swiglu_quant():
+        acc = acc1_vmem[...]
+        g, u = acc[:, :dff], acc[:, dff:]
+        h = (g * jax.nn.sigmoid(g)) * u                    # f32 [rows, dff]
+        h3 = h.reshape(rows, nhk, QBLOCK)
+        hs = jnp.maximum(jnp.max(jnp.abs(h3), axis=-1), _EPSQ) / FP8_MAX
+        hq = jnp.clip(h3 / hs[..., None], -FP8_MAX, FP8_MAX)
+        hq_vmem[...] = hq.reshape(rows, dff).astype(jnp.float8_e4m3fn)
+        hs_vmem[...] = hs
+
+    # ---- phase 2 (k >= nk1): GEMM2 over W2's (k - nk1)-th quant block.
+    @pl.when(k >= nk1)
+    def _gemm2_step():
+        k2 = k - nk1
+        hq = jax.lax.dynamic_slice(
+            hq_vmem[...], (0, k2 * QBLOCK), (rows, QBLOCK))
+        hs = jax.lax.dynamic_slice(hs_vmem[...], (0, k2), (rows, 1))
+        part = jax.lax.dot_general(
+            hq.astype(jnp.bfloat16), w2_q_ref[...].astype(jnp.bfloat16),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32)            # [rows, d]
+        acc2_vmem[...] += part * hs * w2_s_ref[...].reshape(1, d)
+
+    # ---- finalize (last k): stage + per-expert eager combine ----
+    @pl.when(k == nk1 + nhk - 1)
+    def _finalize():
+        # ANY-space refs can't be stored to directly — stage via VMEM + DMA.
+        y_vmem[...] = acc2_vmem[...].astype(jnp.bfloat16)
+        stores = [
+            pltpu.make_async_copy(
+                y_vmem.at[pl.ds(r * cap_e, cap_e)],
+                stage_hbm.at[w, r, e], load_sem)
+            for r in range(ep)
+        ]
+        for op in stores:
+            op.start()
+        for op in stores:
+            op.wait()
+
+        # Same slot convention as dispatch: starts signal the destination's
+        # comb_recv_sem[my_id]; the drain waits slot r per source shard.
+        for r in range(ep):
+            pltpu.make_async_remote_copy(
+                stage_hbm.at[w, r, e],
+                y_back_hbm.at[w, my_id, e],
+                comb_send_sem.at[r],
+                comb_recv_sem.at[my_id],
+                device_id=(r,),
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
 
     # ---- drain: at the last grid step, absorb every combine descriptor.
     # Same-shape slabs make wait-by-descriptor order-insensitive; the
     # semaphore byte counts total exactly n_waves*e_wl*ep descriptors.
-    @pl.when(jnp.logical_and(w == n_waves - 1, e == e_wl - 1))
+    @pl.when(jnp.logical_and(
+        jnp.logical_and(w == n_waves - 1, e == e_wl - 1),
+        k == nk1 + nhk - 1))
     def _drain():
         for wv in range(n_waves):
             for ee in range(e_wl):
@@ -408,8 +455,8 @@ def _mega_kernel(
 
 def mega_moe_shard(
     buckets: DispatchBuckets,
-    w13_deq: jax.Array,        # [E_local, d, 2dff] bf16 (resident, dequantized)
-    w2_deq: jax.Array,         # [E_local, dff, d]  bf16
+    w13: "GemmWeight",         # q [E_local, d, 2dff] e4m3, s_bcast [E_local, d/128, 1, 2dff]
+    w2: "GemmWeight",          # q [E_local, dff, d] e4m3, s_bcast [E_local, dff/128, 1, d]
     m: int,
     *,
     axis_name: str,
@@ -418,19 +465,30 @@ def mega_moe_shard(
 ) -> jax.Array:
     """Per-shard body (call inside shard_map): mega-kernel + combine.
     Returns this shard's routed-expert output [m, d] f32 (caller adds the
-    shared expert and gates were already folded by combine_results)."""
+    shared expert; gates are folded by combine_results).
+
+    Weights stream as 128-row quant-block tiles through the third grid
+    axis — per-step VMEM is one (QBLOCK, N) tile per weight, not the whole
+    expert, so Pro shapes (42 MiB/expert W13) fit any generation's VMEM.
+    The clamped index_maps pin the off-phase weight to its last/first
+    block, so Pallas's revisit rule fetches nothing extra during the
+    other phase."""
     n_waves_b, ep, e_wl, cap_e, d = buckets.q.shape
     assert (n_waves_b, ep) == (n_waves, ep_size)
     nsk = buckets.s.shape[-1]
-    dff = w2_deq.shape[1]
-    e_local = w13_deq.shape[0]
+    e_local, dff, _ = w2.q.shape
     assert e_local == n_waves * e_wl
+    nk1 = d // QBLOCK
+    nhk = dff // QBLOCK
 
-    grid = (n_waves, e_wl)
+    grid = (n_waves, e_wl, nk1 + nhk)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     buf_shape = jax.ShapeDtypeStruct(buckets.q.shape, buckets.q.dtype)
     sbuf_shape = jax.ShapeDtypeStruct(buckets.s.shape, jnp.float32)
     y_shape = jax.ShapeDtypeStruct((n_waves, ep, e_wl, cap_e, d), jnp.bfloat16)
+
+    def le(w, e):
+        return w * e_wl + e
 
     _, _, _, y_back = pl.pallas_call(
         partial(_mega_kernel, axis_name=axis_name, n_waves=n_waves, ep=ep,
@@ -438,14 +496,26 @@ def mega_moe_shard(
         grid=grid,
         in_specs=[
             any_spec, any_spec,
-            pl.BlockSpec((1, d, 2 * dff), lambda w, e: (w * e_wl + e, 0, 0)),
-            pl.BlockSpec((1, dff, d), lambda w, e: (w * e_wl + e, 0, 0)),
+            pl.BlockSpec((None, QBLOCK, 2 * dff),
+                         lambda w, e, k: (le(w, e), jnp.minimum(k, nk1 - 1), 0)),
+            pl.BlockSpec((None, 1, 1, 2 * dff),
+                         lambda w, e, k: (le(w, e), jnp.minimum(k, nk1 - 1), 0, 0)),
+            pl.BlockSpec((None, QBLOCK, d),
+                         lambda w, e, k: (le(w, e),
+                                          jnp.clip(k - nk1, 0, nhk - 1), 0)),
+            pl.BlockSpec((None, 1, 1, d),
+                         lambda w, e, k: (le(w, e),
+                                          jnp.clip(k - nk1, 0, nhk - 1), 0, 0)),
         ],
         out_specs=[any_spec, any_spec, any_spec, any_spec],
         out_shape=[buf_shape, sbuf_shape, y_shape, y_shape],
         scratch_shapes=[
             pltpu.VMEM((ep * cap_e, d), buckets.q.dtype),
             pltpu.VMEM((ep * cap_e, nsk), jnp.float32),
+            pltpu.VMEM((ep * cap_e, dff), jnp.float8_e4m3fn),
+            pltpu.VMEM((ep * cap_e, nhk), jnp.float32),
+            pltpu.VMEM((ep * cap_e, 2 * dff), jnp.float32),
+            pltpu.VMEM((ep * cap_e, d), jnp.float32),
             pltpu.VMEM((ep * cap_e, d), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((2, ep)),
             pltpu.SemaphoreType.DMA((2, ep)),
@@ -454,12 +524,11 @@ def mega_moe_shard(
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary", "arbitrary"),
+            dimension_semantics=("arbitrary", "arbitrary", "arbitrary"),
             collective_id=0,
         ),
         interpret=pltpu.InterpretParams(),
-    )(buckets.q, buckets.s,
-      w13_deq.astype(jnp.bfloat16), w2_deq.astype(jnp.bfloat16))
+    )(buckets.q, buckets.s, w13.q, w13.s_bcast, w2.q, w2.s_bcast)
 
     # y_back[w, dst, e, c] is the result of MY send slot [w, dst, e, c] —
     # pair ids never travel over the wire.

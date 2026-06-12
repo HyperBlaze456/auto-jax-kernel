@@ -254,12 +254,25 @@ slabs, byte-counting semaphores).
 
 Verified on 2- and 4-shard interpret meshes (`InterpretParams`) against
 a dense oracle (≲0.3% rel = fp8 quant points only), bitwise
-deterministic, including fully-skewed hot-shard routing. v1 scoping:
-expert weights arrive as whole `(d, 2dff)` BlockSpec tiles (bf16,
-dequantized at load) — Pro-scale weights need the inner k-loop refactor
-+ fp8-block-scaled in-kernel GEMM before TPU deploy; recv/stage buffers
-are ANY-space HBM (direct stores to ANY refs are illegal — stage via
-VMEM + `make_async_copy`).
+deterministic, including fully-skewed hot-shard routing and asymmetric
+GEMM phase lengths. Recv/stage buffers are ANY-space HBM (direct stores
+to ANY refs are illegal — stage via VMEM + `make_async_copy`).
+
+**k-loop weight streaming (Pro-scale).** The third grid axis steps both
+expert GEMMs in 128-row quant blocks: phase 1 (k < d/128) accumulates
+GEMM1 against W13's k-th `(128, 2dff)` fp8 tile; the phase boundary runs
+SwiGLU + fp8 hidden re-quant in-register; phase 2 streams W2 the same
+way. Per-step VMEM holds one weight tile (~0.75 MiB at Pro shapes), so
+Pro's 42 MiB/expert W13 streams through any generation's VMEM; resident
+scratch (accumulators + fp8 x/h + staging) ≈ 5 MiB at rows=64. The
+in-kernel math is `gmm_fp8`'s two-level accumulation verbatim — fp8
+payloads, per-quant-block row·col scales applied to the f32 partial —
+so the mega-kernel now carries the full fp8-block-scaled numerics, no
+bf16-dequantized weights anywhere. Clamped index_maps pin the off-phase
+weight to a constant block, so Pallas's revisit rule fetches nothing
+extra during the other phase. (Indexing footgun encoded in the code:
+`None`-squeezed BlockSpec leading dims mean the kernel ref is already
+`[128, N]` — indexing `[0]` silently drops a real axis.)
 
 ## 10. Page-aligned gathers (`attention_paged.py`) — DONE
 
@@ -277,17 +290,158 @@ coarsening is the quality knob: `page_recall` measures overlap vs
 row-top-k (~0.8 on uncorrelated random scores = structural worst case;
 real indexer scores correlate within pages).
 
-## 11. Future work, in value order
+## 11. Theoretical max throughput, TPU v5e–v7 (roofline)
 
-1. Mega-kernel k-loop refactor: fp8-block-scaled in-kernel expert GEMM
-   (gmm-style two-level accum) + tiled weights for Pro shapes.
-2. Prefill q-block gather batching (splash-style top-k union).
-3. Sort-by-destination two-pass dK reduction (kills the contribution
+Numbers from `dsv4/serving/throughput_roofline.py` (`python -m
+dsv4.serving.throughput_roofline`); param counts are exact
+(`jax.eval_shape` over `init_params`), hardware numbers are vendor peaks.
+Two regimes: the **compute ceiling** (large-batch limit: weight streaming
+amortizes to ~0/token; only KV gathers, the **indexer's full ki-cache
+scan**, and ICI dispatch/combine remain per-token) and **memory-bound
+decode** (§11.1 — the regime real serving lives in, where per-step weight
+streaming dominates). Per-token cost = 2·(activated params) split
+fp8/bf16 + context terms; throughput = 1/max(t_compute, t_hbm, t_ici).
+v5e/v5p price fp8 at the bf16 rate (`compute_upcast=True`); v6e+ at 2×
+(native fp8 MXU, the config.py convention).
+
+**Model totals** (exact):
+
+| | total | weights on HBM | activated/tok | static GF/tok (fp8+bf16) |
+|---|---|---|---|---|
+| Flash | 286.6B | 312 GB | 13.5B | 26.9 (15.3 + 11.6) |
+| Pro | 1585.3B | 1687 GB | 49.3B | 98.6 (56.9 + 41.7) |
+
+**Max decode throughput, tok/s/chip** (binding constraint in parens when
+not compute). Contexts go to 1M — the architecture's design target; the
+compressed cache costs Flash 0.15 / 0.59 / 4.7 GB per sequence at
+32K / 128K / 1M (Pro: 0.21 / 0.84 / 6.7):
+
+| chip (peak bf16/fp8 TF/s, HBM GB/s) | Flash 32K | Flash 128K | Flash 1M | Pro 32K | Pro 128K | Pro 1M |
+|---|---|---|---|---|---|---|
+| v5e (197/–, 819) | 6.1k | 4.1k (bw) | 0.54k (bw) | 1.7k | 1.5k | 0.38k (bw) |
+| v5p (459/–, 2765) | 14.1k | 10.7k | 1.8k (bw) | 4.0k | 3.4k | 1.3k (bw) |
+| v6e Trillium (918/1836, 1640) | 29.1k (bw) | 8.3k (bw) | 1.1k (bw) | 10.6k | 5.6k (bw) | 0.75k (bw) |
+| v7 Ironwood (2307/4614, 7370) | 92.6k | 37.3k (bw) | 4.9k (bw) | 26.7k | 22.0k | 3.4k (bw) |
+
+Capacity floor (weights at 85% HBM, before KV): Flash needs ≥23 v5e /
+4 v5p / 12 v6e / 2 v7 chips; Pro ≥125 / 21 / 63 / 11. Per-chip numbers
+above already assume EP sharding at ≥ that scale.
+
+Readings:
+
+- **Short context, every chip is compute-bound** — the kernel suite's
+  job is MXU occupancy (full-N tiles, wave overlap), not byte shaving.
+- **Long context flips bandwidth-bound, and 1M is bandwidth-bound on
+  every generation** (v6e flips at 32K, everything by 1M): the dominant
+  term is not the KV gather (371 KB/tok/layer, already minimal) but the
+  **indexer scan** — n_blk·c_I bf16 = 2 MB/tok/layer at 32K, 8 MB at
+  128K, 67 MB at 1M (1.4 GB/tok Flash, ~93% of all decode bytes). That
+  makes indexer-cache quantization (fp8 ki would halve it) and
+  hierarchical / pruned indexer scans (§12 item 7) worth more than any
+  further gather work at long context.
+- **ICI never binds** (≥4× headroom everywhere, ep→∞ worst case
+  3.2 MB/tok Flash / 8.0 MB/tok Pro): the paper's balance condition holds
+  on every generation; overlap quality, not link bandwidth, stays the
+  EP constraint (§4, §9).
+- Real kernels land at 40–70% of peak; treat the table as the ceiling
+  the roofline permits, not a forecast. Prefill is the same compute bound
+  (weights stream once per long sequence ⇒ effectively free), so e.g.
+  Flash prefill ceiling ≈ 92k tok/s on one v7 at 32K.
+
+### 11.1 Memory-bound decode (the regime that matters)
+
+Same script, `decode_memory_bound`: per-step HBM bytes as a function of
+per-chip batch `b` (decode sequences resident per chip). Bytes/step/chip =
+**dense bf16 weights** (attn/mHC/router/head + shared expert — replicated
+over the EP axis, so re-read every step regardless of fleet width:
+12.8 GB Flash / 45.9 GB Pro) + **routed expert hits** (expected distinct
+experts under uniform top-6 routing × 26.0 MB Flash / 68.1 MB Pro each)
++ `b` × (KV gather + indexer scan + ~8.5/21.0 MB mHC residual traffic).
+Fleets are **KV-capacity-aware**: each cell sizes the fleet so sharded
+weights + `b`×cache fit 85% of HBM, capped at one routed expert per chip
+(max EP width); `—` = infeasible under those rules.
+
+**tok/s/chip** (weight-stream-bound unless marked `c`/`kv`; `×N` = fleet
+grown beyond the weight floor to hold cache; b=1 doubles as interactive
+per-sequence decode speed):
+
+Flash, S=32K:
+
+| chip (weight floor) | b=1 | b=8 | b=32 | b=128 | b=512 |
+|---|---|---|---|---|---|
+| v5e (×23) | 46 ×24 | 271 ×26 | 1.2k ×36 | — | — |
+| v5p (×4) | 143 | 431 | 1.3k ×5 | 5.2k ×6 | 14.1k `c` ×79 |
+| v6e (×12) | 88 | 393 ×13 | 1.5k ×14 | 7.4k ×40 | — |
+| v7 (×2) | 379 | 1.0k | 1.9k | 8.1k ×3 | 32.1k ×4 |
+
+Pro, S=32K:
+
+| chip (weight floor) | b=1 | b=8 | b=32 | b=128 | b=512 |
+|---|---|---|---|---|---|
+| v5e (×125) | 14 ×127 | 113 ×142 | 470 ×251 | — | — |
+| v5p (×21) | 41 | 193 ×22 | 745 ×23 | 3.2k ×32 | — |
+| v6e (×63) | 26 | 186 ×67 | 764 ×83 | — | — |
+| v7 (×11) | 107 | 379 | 1.2k | 5.2k ×13 | 24.7k ×32 |
+
+At S=1M feasibility collapses to the left edge of the table (cache 4.7 GB
+Flash / 6.7 GB Pro per sequence): Flash — v7 runs b ≤ 32 (353 / 890 ×3 /
+3.2k `kv` ×25 tok/s/chip), v5p b ≤ 8 (134 ×5 / 419 ×8), v5e and v6e b=1
+only (43 ×36, 82 ×14); Pro — v7 and v5p b ≤ 8 (104, 393 ×16; 40 ×23,
+249 ×63), v5e/v6e b=1 only.
+
+Readings:
+
+- **Everything below b ≈ 500 sequences/chip is weight-stream-bound** —
+  the §11 ceiling is reachable only at batches serving rarely runs (and
+  at 1M, *cannot* run — see below). The floor is the *replicated dense*
+  stream plus expert hits; adding EP width shrinks per-chip expert bytes
+  but never the dense 12.8/45.9 GB. Levers, in order: bigger per-chip
+  batch, sharding the dense/attn weights too (dp axis), and routing skew
+  (fewer distinct experts hit = fewer bytes; uniform routing is the
+  byte-worst case modeled here).
+- **Interactive latency floor (b=1)**: Flash decodes one sequence at
+  ~379 tok/s on 2×v7 (2.6 ms/step), ~143 on 4×v5p; Pro at ~107 tok/s on
+  11×v7. v6e is *worse* than v5p here despite the newer MXU — at small
+  batch only HBM bandwidth matters (1.64 vs 2.77 TB/s). And the floor
+  barely moves with context: a **1M** sequence still decodes at
+  ~353 tok/s on 2×v7 (379 → 353), because at b=1 the 1.5 GB of
+  KV+indexer reads is only ~7% of the ~21 GB weight stream. Interactive
+  1M is nearly free *in time* — the cost is capacity:
+- **At 1M, KV capacity (not bandwidth) is the binding constraint**:
+  b×4.7 GB (Flash) must fit beside the weights, so per-chip batch is
+  hard-capped (v7 at b≈32 even after growing the fleet to ×25; v5e/v6e
+  at b=1). The compute-bound regime is *unreachable* at 1M on every
+  generation — long-context serving economics are set by HBM capacity
+  and the indexer scan, full stop.
+- **At 128K+ a `kv`-bound window opens between weight- and compute-bound**
+  (197 MB/tok Flash at 128K, 1.51 GB at 1M — ~80–93% indexer scan). The
+  gather itself (371 KB/tok/layer) is already minimal — the fixes are
+  §12 item 7 (fp8 ki cache, coarse-to-fine scan), not more gather work.
+- **model.py's SWA cache is a 1M blocker as written**: `init_state`
+  materializes raw rows at full `s_max` (580 B × S × n_layers ≈ 25 GB/seq
+  at 1M Flash — 5× the entire architectural cache) although only the
+  n_win=128 window is ever read. Ring-buffering it is §12 item 8; the
+  capacity numbers above assume that fix.
+- mHC residual traffic (8.5/21 MB/tok) is the same order as the KV
+  gather — the fused mhc.py kernels (§1) are pulling real roofline
+  weight here, not just XLA-overhead cleanup.
+
+## 12. Future work, in value order
+
+1. Prefill q-block gather batching (splash-style top-k union).
+2. Sort-by-destination two-pass dK reduction (kills the contribution
    buffer round trip in attention bwd).
-4. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
-5. Indexer score-distillation objective (paper §2.3.1) so indexer
+3. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
+4. Indexer score-distillation objective (paper §2.3.1) so indexer
    params train; today they are principled zero-grad under the LM loss.
-6. EP training wiring (shard_map a2a autodiffs natively; substitute
+5. EP training wiring (shard_map a2a autodiffs natively; substitute
    grouped_ffn into moe_forward_ep when multi-host training lands).
-7. Wire paged selection into model.py as a serving config knob
+6. Wire paged selection into model.py as a serving config knob
    (kernel + selection exist; default stays row-exact).
+7. Cut the indexer-scan bytes (the §11 long-context bottleneck): fp8 ki
+   cache (−2×), and/or a coarse-to-fine scan (score page maxes first,
+   rescan only surviving pages — composes with §10's paged selection).
+8. Ring-buffer the raw SWA cache in `init_state` (only the n_win window
+   is ever read; the full-`s_max` allocation is 25 GB/seq at 1M Flash,
+   5× the whole compressed cache — the §11.1 capacity blocker for the
+   model's 1M design target).
