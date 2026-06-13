@@ -290,3 +290,26 @@ def test_moe_ep_diff_matches_local_diff():
     np.testing.assert_allclose(np.asarray(out_ep), np.asarray(out_local),
                                rtol=BF16_POLICY_RTOL, atol=2e-2)
     assert _rel(dx_ep, dx_local) < BF16_POLICY_RTOL
+
+
+def test_segment_reduce_sorted_matches_reference():
+    """The §13.12 sort-by-destination reduction: per destination row, the
+    sum of its contributions — equal to a plain scatter-add (numpy
+    groupby) up to f32 reassociation, deterministic, and -1 entries
+    dropped."""
+    ks = jax.random.split(jax.random.PRNGKey(91), 2)
+    B, N, c, n_dest = 2, 40, 16, 8
+    dest = jax.random.randint(ks[0], (B, N), -1, n_dest).astype(jnp.int32)
+    contrib = jax.random.normal(ks[1], (B, N, c), jnp.float32)
+    got = at._segment_reduce_sorted(dest, contrib, n_dest)
+    assert got.shape == (B, n_dest, c)
+    ref = np.zeros((B, n_dest, c), np.float64)
+    d, ct = np.asarray(dest), np.asarray(contrib, np.float64)
+    for b in range(B):
+        for i in range(N):
+            if d[b, i] >= 0:
+                ref[b, d[b, i]] += ct[b, i]
+    np.testing.assert_allclose(np.asarray(got), ref, rtol=1e-4, atol=1e-4)
+    # deterministic
+    np.testing.assert_array_equal(
+        np.asarray(got), np.asarray(at._segment_reduce_sorted(dest, contrib, n_dest)))

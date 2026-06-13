@@ -446,8 +446,9 @@ Readings:
 byte cuts, and the SWA ring buffer — are DONE; they became §13.)
 
 1. ~~Prefill q-block gather batching~~ — DONE, became §13.8.
-2. Sort-by-destination two-pass dK reduction (kills the contribution
-   buffer round trip in attention bwd).
+2. ~~Sort-by-destination two-pass dK reduction~~ — DONE (reduction
+   reorder), became §13.12. Full contribution-buffer elimination
+   analyzed there and deferred (trades memory for n_h× source bandwidth).
 3. ~~Native-fp8 MXU dots on v6e+ + tm autotune~~ — DONE, became §13.10.
 4. ~~Indexer score-distillation objective~~ — DONE, became §13.9.
 5. ~~EP training wiring~~ — DONE, became §13.11.
@@ -838,3 +839,41 @@ gradient match the local diff path within the bf16-gradient policy, i.e.
 the dispatch/combine round-trip is autodiff-transparent. Substituting it
 into `train_step`'s MoE half is the multi-host enablement; the local path
 stays the single-host default.
+
+### 13.12 Sort-by-destination dK reduction (`attention_train.py`)
+
+The training attention backward re-gathers each query token's K rows and
+emits a per-(token, slot) contribution buffer `dkc_contrib[B,T,k_pad,c]`
+(+ the SWA twin), which is then reduced to `dK_comp[B,S_c,c]` over the
+gather indices. That reduction was a duplicate-index scatter-add
+(`zeros.at[idx].add(contrib)`): correct and deterministic, but on TPU a
+hot destination row (a block many query tokens selected) serializes its
+colliding writes.
+
+`_segment_reduce_sorted` reframes it as **sort-by-destination +
+segment-sum**: sort the contributions by their destination K-row (so all
+contributions to a row are contiguous), then one `segment_sum` with
+`indices_are_sorted=True` — a sequential scan, no write collisions. Per-
+batch ranges are offset into one flat segment space so a single
+segment_sum covers the batch; invalid (-1) slots route to a dropped dump
+segment. Same paper-§3.3 fixed-order determinism (asserted bit-
+reproducible), graded against the dense fp32 oracle within the
+bf16-gradient policy.
+
+**What this does and doesn't do.** It removes the scatter's destination-
+collision serialization — the realizable half of the original §12 item.
+It does **not** eliminate the contribution buffer's HBM round-trip: that
+buffer is still written by the bwd kernel and read by the reduction.
+Killing it outright needs a *destination-keyed* recompute kernel — one
+that iterates K-rows and, per row, re-reads the q/dout ([n_h·c]) of every
+source token that selected it and recomputes the contribution in-place.
+That trades the buffer's memory for n_h× more source-side read traffic
+(the contribution is the head-reduced [c]; the recompute inputs are the
+full [n_h·c]), and needs a ragged-segment static-shape kernel — a poor
+trade for a training-only path, so it is analyzed and left here. The
+sorted segment-sum is the deterministic-reduction win that is
+unambiguously positive.
+
+Tests: `_segment_reduce_sorted` vs a groupby reference (+ determinism);
+the existing oracle-graded attention-train gradient and bit-reproducibility
+tests cover it end to end.

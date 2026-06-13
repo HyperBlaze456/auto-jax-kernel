@@ -60,6 +60,33 @@ from .config import ServingTiles
 _NEG_INF = -1.0e30
 
 
+def _segment_reduce_sorted(dest, contrib, n_dest):
+    """Deterministic dK reduction by sort-by-destination + segment-sum.
+
+    ``dest`` [B, N] int32 (-1 = invalid), ``contrib`` [B, N, c] f32 →
+    ``[B, n_dest, c]`` f32, where output row r is the sum of every
+    contribution whose destination is r. Sorting by destination makes the
+    same-row contributions contiguous, so the reduce is a single sorted
+    ``segment_sum`` (a scan) rather than a collision-serialized
+    scatter-add — fixed order either way (bit-reproducible), but the TPU
+    write-conflict serialization on hot destinations is removed. Invalid
+    (-1) entries route to a dump segment that is dropped.
+    """
+    B, N, c = contrib.shape
+    valid = dest >= 0
+    # Global segment id per (batch, entry); invalids -> the per-batch dump
+    # row n_dest. Batches occupy disjoint [b*(n_dest+1), ...) ranges so one
+    # flat segment_sum handles all of them.
+    g = (jnp.where(valid, dest, n_dest)
+         + jnp.arange(B, dtype=jnp.int32)[:, None] * (n_dest + 1)).reshape(-1)
+    cf = contrib.reshape(B * N, c)
+    order = jnp.argsort(g)                              # stable, deterministic
+    seg = jax.ops.segment_sum(
+        cf[order], g[order], num_segments=B * (n_dest + 1),
+        indices_are_sorted=True)
+    return seg.reshape(B, n_dest + 1, c)[:, :n_dest]
+
+
 # ---------------------------------------------------------------------------
 # Shared gather plumbing (single bf16 K array per cache)
 # ---------------------------------------------------------------------------
@@ -357,21 +384,30 @@ def _make_diffable(n_win: int, chunk: int, interpret: bool):
             dout.astype(jnp.bfloat16),
             n_win=n_win, chunk=chunk, interpret=interpret)
 
-        # Deterministic reductions (XLA scatter-add: fixed update order).
-        b_ix = jnp.arange(B, dtype=jnp.int32)[:, None, None]
+        # Deterministic reductions, sort-by-destination (paper §3.3 fixed-
+        # order accumulation). Sorting the per-(token,slot) contributions by
+        # their destination K-row turns the reduction from a duplicate-index
+        # scatter-add (write-conflict-serialized on TPU) into one sorted
+        # segment-sum (a sequential scan) — same deterministic guarantee,
+        # the destination-collision serialization gone. The contribution
+        # buffer itself is still materialized; killing it outright needs a
+        # destination-keyed recompute kernel that re-reads each source
+        # token's q/dout ([n_h·c]) per pair instead of the reduced [c]
+        # contribution — n_h× more source traffic for the memory saving,
+        # not pursued (HARDWARE_NOTES §13.12).
         valid_k = idx >= 0                                  # [B, T, k_pad]
         contrib = dkc_contrib.astype(jnp.float32) * valid_k[..., None]
-        dkc = jnp.zeros((B, s_c, c), jnp.float32).at[
-            jnp.broadcast_to(b_ix, idx.shape), jnp.maximum(idx, 0)
-        ].add(contrib)
+        dkc = _segment_reduce_sorted(
+            jnp.where(valid_k, idx, -1).reshape(B, -1),
+            contrib.reshape(B, -1, c), s_c)
 
         start = jnp.clip(pos - n_win + 1, 0, s_r - n_win)   # [B, T]
         w_pos = start[..., None] + jnp.arange(n_win, dtype=jnp.int32)
         valid_w = (w_pos <= pos[..., None]) & (w_pos > pos[..., None] - n_win)
         contrib_w = dsw_contrib.astype(jnp.float32) * valid_w[..., None]
-        dsw = jnp.zeros((B, s_r, c), jnp.float32).at[
-            jnp.broadcast_to(b_ix, w_pos.shape), w_pos
-        ].add(contrib_w)
+        dsw = _segment_reduce_sorted(
+            jnp.where(valid_w, w_pos, -1).reshape(B, -1),
+            contrib_w.reshape(B, -1, c), s_r)
 
         # dsink (closed form; sink contributes only through lse).
         sink_b = sink.astype(jnp.float32)[None, None, :, None]
