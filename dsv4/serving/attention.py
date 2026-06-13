@@ -143,13 +143,22 @@ def _sparse_mqa_kernel(
     n_win: int,
     s_raw: int,
     scale: float,
+    swa_ring: bool,
 ):
     b = pl.program_id(0)
     n_chunks = k_pad // chunk
     pos = pos_smem_ref[0, 0]
 
     # ---- SWA window DMA (single contiguous descriptor per component) ----
-    start = jnp.clip(pos - n_win + 1, 0, s_raw - n_win)
+    if swa_ring:
+        # Dual-write unrolled ring (s_raw == 2*n_win): position p lives at
+        # slots p % n_win and p % n_win + n_win, so the window
+        # [pos-n_win+1, pos] is ONE contiguous slab starting at
+        # (pos+1) % n_win — in position order, exactly like the full-cache
+        # path (same single descriptor, same accumulation order).
+        start = (pos + 1) % n_win
+    else:
+        start = jnp.clip(pos - n_win + 1, 0, s_raw - n_win)
     def swa_copies():
         return [
             pltpu.make_async_copy(sw_nope_hbm.at[b, pl.ds(start, n_win)], swn_buf, swa_sem),
@@ -224,8 +233,15 @@ def _sparse_mqa_kernel(
         c.wait()
     k_n = (swn_buf[...].astype(jnp.float32) * sws_buf[...]).astype(jnp.bfloat16)
     k_r = swr_buf[...].astype(jnp.bfloat16)
-    w_pos = start + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1)
-    valid = jnp.logical_and(w_pos <= pos, w_pos > pos - n_win)
+    if swa_ring:
+        # buffer row i holds position pos - n_win + 1 + i by construction;
+        # only pre-sequence (negative) positions need masking.
+        w_pos = (pos - n_win + 1
+                 + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1))
+        valid = w_pos >= 0
+    else:
+        w_pos = start + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1)
+        valid = jnp.logical_and(w_pos <= pos, w_pos > pos - n_win)
     m_i, l_i, acc_n, acc_r = flash_update(m_i, l_i, acc_n, acc_r, k_n, k_r, valid)
 
     # ---- finalize with the per-head sink (virtual zero-value logit) ----
@@ -252,9 +268,14 @@ def sparse_mqa_gathered(
     *,
     n_win: int,
     rope_dim: int = 64,
+    swa_ring: bool = False,
     tiles: ServingTiles | None = None,
 ) -> jax.Array:
-    """Returns ``o[B, T, n_h, c]``. See module docstring for semantics."""
+    """Returns ``o[B, T, n_h, c]``. See module docstring for semantics.
+
+    ``swa_ring=True`` reads the raw cache as a dual-write unrolled ring of
+    ``2 * n_win`` rows (decode); ``False`` reads it as a flat position-
+    indexed array (prefill's transient full-length rows)."""
     if tiles is None:
         from .config import tiles_for
         tiles = tiles_for()
@@ -265,7 +286,11 @@ def sparse_mqa_gathered(
     s_raw = swa.nope.shape[1]
     if swa.nope.shape[-1] != c_nope or kc.nope.shape[-1] != c_nope:
         raise ValueError("cache nope width must match q (c - rope_dim)")
-    if s_raw < n_win:
+    if swa_ring:
+        if s_raw != 2 * n_win:
+            raise ValueError(f"ring SWA cache must be 2*n_win={2*n_win} rows, "
+                             f"got {s_raw}")
+    elif s_raw < n_win:
         raise ValueError(f"SWA cache length {s_raw} < n_win={n_win}")
 
     # Pad k to a chunk multiple with -1 (masked out in-kernel).
@@ -283,7 +308,7 @@ def sparse_mqa_gathered(
     grid = (B, T)
     o_nope, o_rope = pl.pallas_call(
         partial(_sparse_mqa_kernel, k_pad=k_pad, chunk=chunk, n_win=n_win,
-                s_raw=s_raw, scale=float(c) ** -0.5),
+                s_raw=s_raw, scale=float(c) ** -0.5, swa_ring=swa_ring),
         grid=grid,
         in_specs=[
             pl.BlockSpec((1, 1, k_pad), lambda b, t: (b, t, 0),

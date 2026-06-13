@@ -6,6 +6,10 @@ Produces the numbers in HARDWARE_NOTES.md §11. Two regimes:
 weight streaming amortizes to ~0/token and only the per-token terms
 (gather, indexer scan, ICI) remain.
 
+``package_comparison``: before/after the §13 long-context memory package
+(fp8 ki, SWA ring, paged scan) — context bytes/tok, cache/seq, and
+memory-bound throughput at a fixed fleet.
+
 ``decode_memory_bound``: the regime serving actually lives in — per-step
 HBM bytes as a function of per-chip batch ``b``:
 
@@ -91,30 +95,57 @@ class ModelCosts:
         # masters; 2 B/param is the serving rate), shared expert as stored fp8.
         return 2.0 * (self.cnt["other"] + self.cnt["head"]) + self.byts["shared"]
 
-    def dyn(self, S: int) -> tuple[float, float]:
-        """(FLOPs, HBM bytes) per decode token from context-dependent attention."""
+    def dyn(self, S: int, *, ki_fp8: bool = True,
+            pages: int = 0, exact: bool = False) -> tuple[float, float]:
+        """(FLOPs, HBM bytes) per decode token from context-dependent
+        attention. ``ki_fp8``: indexer keys stored fp8+f32/row (the serving
+        format; False = the pre-package bf16 cache). ``pages``: csa_pages —
+        the indexer scans only per-page summaries (n_blk/P of them); the
+        gather moves the same (topk + n_win) rows either way. ``exact``:
+        csa_pages_exact (§13.7) — the scan reads BOTH envelope caches
+        (2x summary bytes, 4 sign-split dots each) plus a 2*topk-row
+        fine rescan; the gather is per-row again (same row count).
+
+        Scan bytes are charged at the *context* S, not the allocation:
+        exact only with the §13.5 valid-prefix kernel (indexer_scan.py) —
+        the pre-§13.5 XLA scan paid s_max//m entries regardless of
+        position."""
         cs, hc_ = self.cfg.csa, self.cfg.hca
         n_blk = S // cs.m
         ne = S // hc_.m_prime
+        ki_entry = (cs.c_I + 4) if ki_fp8 else cs.c_I * 2
+        n_scan = n_blk // pages if pages else n_blk
+        envs = 2 if (pages and exact) else 1       # summary caches read
+        rescan = 2 * cs.topk if (pages and exact) else 0   # R*P rows, R=2k/P
         f = (self.n_csa * (2 * 2 * cs.n_h * cs.c * (cs.topk + cs.n_win)
-                           + 2 * cs.n_I_h * cs.c_I * n_blk)
+                           + 2 * cs.n_I_h * cs.c_I
+                           * (n_scan * (4 if exact and pages else 1)
+                              + rescan))
              + self.n_hca * (2 * 2 * hc_.n_h * hc_.c * (ne + hc_.n_win))
              + self.n_swa * (2 * 2 * cs.n_h * cs.c * cs.n_win))
-        b = (self.n_csa * ((cs.topk + cs.n_win) * ROW_BYTES + n_blk * cs.c_I * 2)
+        b = (self.n_csa * ((cs.topk + cs.n_win) * ROW_BYTES
+                           + (n_scan * envs + rescan) * ki_entry)
              + self.n_hca * ((ne + hc_.n_win) * ROW_BYTES)
              + self.n_swa * (cs.n_win * ROW_BYTES))
         return f, b
 
-    def kv_seq_bytes(self, S: int) -> float:
-        """Per-sequence cache bytes at context S — the *architectural* cost
-        (ring-buffered SWA window). NB: model.py's init_state currently
-        materializes the raw SWA cache at full s_max (580 B x S x n_layers
-        ~ 25 GB/seq at 1M Flash) — that must become a ring buffer before
-        1M serving; see HARDWARE_NOTES §12."""
+    def kv_seq_bytes(self, S: int, *, ki_fp8: bool = True, pages: int = 0,
+                     exact: bool = False, swa_ring: bool = True) -> float:
+        """Per-sequence cache bytes at context S, as model.py allocates it:
+        compressed entries + fp8 ki (+ page summaries; two envelope caches
+        in §13.7 exact mode) + the dual-write 2*n_win SWA ring.
+        ``swa_ring=False`` reproduces the pre-package full-s_max raw cache
+        (580 B x S x n_layers ~ 25 GB/seq at 1M Flash — the old 1M
+        capacity blocker, kept for the comparison table)."""
         cs, hc_ = self.cfg.csa, self.cfg.hca
-        per_csa = (S // cs.m) * (ROW_BYTES + cs.c_I * 2) + cs.n_win * ROW_BYTES
-        per_hca = (S // hc_.m_prime) * ROW_BYTES + hc_.n_win * ROW_BYTES
-        per_swa = cs.n_win * ROW_BYTES
+        ki_entry = (cs.c_I + 4) if ki_fp8 else cs.c_I * 2
+        envs = 2.0 if (pages and exact) else 1.0
+        ki_seq = ki_entry * (1.0 + (envs / pages if pages else 0.0))
+        swa_csa = 2 * cs.n_win * ROW_BYTES if swa_ring else S * ROW_BYTES
+        swa_hca = 2 * hc_.n_win * ROW_BYTES if swa_ring else S * ROW_BYTES
+        per_csa = (S // cs.m) * (ROW_BYTES + ki_seq) + swa_csa
+        per_hca = (S // hc_.m_prime) * ROW_BYTES + swa_hca
+        per_swa = swa_csa
         return self.n_csa * per_csa + self.n_hca * per_hca + self.n_swa * per_swa
 
     @property
@@ -122,6 +153,8 @@ class ModelCosts:
         # mHC residual-stream round trips per token: per half, the fused
         # kernels read X (hc*d), read X+f, write hc*d in bf16 (§1) -> ~6*hc*d*2
         # per layer. Matters only in the memory-bound regime.
+        # Exact only with the §13.6 epilogue fusion: pre-§13.6 the gate
+        # path re-read X' once more per half (8*hc*d*2 per layer, +33%).
         return 6 * self.cfg.hc * self.cfg.d * 2 * self.cfg.n_layers
 
 
@@ -262,8 +295,70 @@ def decode_memory_bound(name: str, cfg: ModelConfig,
           "exceed max EP width); b = decode sequences per chip")
 
 
+def package_comparison(name: str, cfg: ModelConfig,
+                       contexts=(32768, 131072, 1048576),
+                       batches=(1, 8, 32)) -> None:
+    """What the long-context memory package buys (HARDWARE_NOTES §13):
+    per-token context bytes, per-sequence cache, and memory-bound decode
+    throughput, before/after each stage. Throughput model = the
+    decode_memory_bound recipe at a fixed fleet (the new format's fleet,
+    so the columns isolate bytes, not fleet-resizing effects)."""
+    mc = model_costs(cfg)
+    E, topk, L = cfg.moe.n_routed, cfg.moe.topk, cfg.n_layers
+    modes = [
+        ("pre-package (bf16 ki, full-s_max SWA)",
+         dict(ki_fp8=False, pages=0), dict(swa_ring=False)),
+        ("fp8 ki + SWA ring (serving default)",
+         dict(ki_fp8=True, pages=0), dict(swa_ring=True)),
+        ("+ paged scan/gather P=8 (csa_pages=8)",
+         dict(ki_fp8=True, pages=8), dict(swa_ring=True)),
+        ("+ exact envelopes P=8 (csa_pages_exact)",
+         dict(ki_fp8=True, pages=8, exact=True), dict(swa_ring=True)),
+    ]
+    print(f"\n=== {name}: long-context memory package ===")
+    for S in contexts:
+        print(f"\n-- context S={S//1024}K")
+        for label, dk, sk in modes:
+            f_dyn, b_dyn = mc.dyn(S, **dk)
+            kv = mc.kv_seq_bytes(S, **dk, **sk)
+            line = (f"  {label:42s} ctx {b_dyn/1e6:>8.2f} MB/tok  "
+                    f"cache {kv/1e9:>6.2f} GB/seq |")
+            for chip, h in HW.items():
+                if chip != "v7 Ironwood":
+                    continue
+                cells = []
+                for b in batches:
+                    # fleet sized for the *current serving format* in every
+                    # row so throughput deltas isolate the byte changes
+                    kv_now = mc.kv_seq_bytes(S)
+                    room = h["hbm_gb"] * 0.85e9 - b * kv_now
+                    n = math.ceil(mc.total_bytes / room) if room > 0 else None
+                    if n is None or n > E:
+                        cells.append(f"b={b}: --")
+                        continue
+                    n = max(min_chips(mc, h), n)
+                    if b * kv > h["hbm_gb"] * 0.85e9 - mc.total_bytes / n:
+                        cells.append(f"b={b}: --")   # infeasible in this mode
+                        continue
+                    hit = (E / n) * (1.0 - (1.0 - topk / E) ** (b * n))
+                    w_bytes = mc.dense_stream_bytes + hit * mc.per_expert_bytes * L
+                    step = w_bytes + b * (b_dyn + mc.act_bytes_tok)
+                    t = max(step / (h["bw"] * 1e9),
+                            b * (mc.f_fp8 / (h["fp8"] * 1e12)
+                                 + (mc.f_bf16 + f_dyn) / (h["bf16"] * 1e12)))
+                    cells.append(f"b={b}: {b/t:>7,.0f}")
+                line += " v7 " + "  ".join(cells)
+            print(line)
+    print("\n  ctx MB/tok = KV gather + indexer scan per decode token;"
+          " tok/s/chip on v7, fleet fixed at the serving-default sizing;"
+          " -- = b x cache exceeds HBM (the pre-package full-s_max SWA"
+          " row shows the old 1M capacity blocker)")
+
+
 if __name__ == "__main__":
     analyze("DSv4-Flash", DSV4_FLASH)
     analyze("DSv4-Pro", DSV4_PRO)
     decode_memory_bound("DSv4-Flash", DSV4_FLASH)
     decode_memory_bound("DSv4-Pro", DSV4_PRO)
+    package_comparison("DSv4-Flash", DSV4_FLASH)
+    package_comparison("DSv4-Pro", DSV4_PRO)

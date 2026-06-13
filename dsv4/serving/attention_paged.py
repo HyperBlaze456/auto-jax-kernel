@@ -156,6 +156,7 @@ def _paged_mqa_kernel(
     gather_sem, swa_sem,
     *,
     kp_pad: int, pages: int, page: int, n_win: int, s_raw: int, scale: float,
+    swa_ring: bool,
 ):
     b = pl.program_id(0)
     n_chunks = kp_pad // pages
@@ -163,7 +164,11 @@ def _paged_mqa_kernel(
     bound = bound_smem_ref[0, 0]
     rows = pages * page
 
-    start = jnp.clip(pos - n_win + 1, 0, s_raw - n_win)
+    if swa_ring:
+        # Dual-write unrolled ring (s_raw == 2*n_win) — see attention.py.
+        start = (pos + 1) % n_win
+    else:
+        start = jnp.clip(pos - n_win + 1, 0, s_raw - n_win)
 
     def swa_copies():
         return [
@@ -233,8 +238,13 @@ def _paged_mqa_kernel(
         c.wait()
     k_n = (swn_buf[...].astype(jnp.float32) * sws_buf[...]).astype(jnp.bfloat16)
     k_r = swr_buf[...].astype(jnp.bfloat16)
-    w_pos = start + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1)
-    valid = jnp.logical_and(w_pos <= pos, w_pos > pos - n_win)
+    if swa_ring:
+        w_pos = (pos - n_win + 1
+                 + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1))
+        valid = w_pos >= 0
+    else:
+        w_pos = start + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1)
+        valid = jnp.logical_and(w_pos <= pos, w_pos > pos - n_win)
     m_i, l_i, acc_n, acc_r = flash_update(m_i, l_i, acc_n, acc_r, k_n, k_r, valid)
 
     sink = sink_ref[...]
@@ -261,11 +271,12 @@ def sparse_mqa_paged(
     page: int,
     n_win: int,
     rope_dim: int = 64,
+    swa_ring: bool = False,
     tiles: ServingTiles | None = None,
 ) -> jax.Array:
     """Paged-gather sparse MQA. Same output contract as
     ``attention.sparse_mqa_gathered`` over ``expand_pages_to_rows`` —
-    asserted by the equivalence test."""
+    asserted by the equivalence test. ``swa_ring`` as in attention.py."""
     if tiles is None:
         from .config import tiles_for
         tiles = tiles_for()
@@ -274,6 +285,9 @@ def sparse_mqa_paged(
     kp = page_idx.shape[-1]
     s_raw = swa.nope.shape[1]
     s_c = kc.nope.shape[1]
+    if swa_ring and s_raw != 2 * n_win:
+        raise ValueError(f"ring SWA cache must be 2*n_win={2*n_win} rows, "
+                         f"got {s_raw}")
     if s_c % page:
         raise ValueError(f"compressed cache length {s_c} must be a multiple "
                          f"of page={page} (allocate in page multiples)")
@@ -293,7 +307,8 @@ def sparse_mqa_paged(
 
     o_nope, o_rope = pl.pallas_call(
         partial(_paged_mqa_kernel, kp_pad=kp_pad, pages=pages, page=page,
-                n_win=n_win, s_raw=s_raw, scale=float(c) ** -0.5),
+                n_win=n_win, s_raw=s_raw, scale=float(c) ** -0.5,
+                swa_ring=swa_ring),
         grid=(B, T),
         in_specs=[
             pl.BlockSpec((1, 1, kp_pad), lambda b, t: (b, t, 0),

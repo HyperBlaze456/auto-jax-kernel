@@ -139,3 +139,76 @@ def dequantize_kv(kv: KVQuant) -> jax.Array:
     """fp32 reference reconstruction ``[..., S, c]``."""
     nope = kv.nope.astype(jnp.float32) * kv.scale
     return jnp.concatenate([nope, kv.rope.astype(jnp.float32)], axis=-1)
+
+
+# ---------------------------------------------------------------------------
+# Per-row fp8 quantization (indexer-key cache)
+# ---------------------------------------------------------------------------
+#
+# The lightning-indexer key cache is *scanned in full* every decode step —
+# at long context that scan is the dominant HBM term (HARDWARE_NOTES §11),
+# ~80–93% of all per-token context bytes at 128K–1M. Storing ki in fp8 with
+# one fp32 scale per row halves it. Numerically this is free at the
+# *selection* level: the indexer score is Σ_h w_h·ReLU(q_h·k_s), and a
+# positive per-row scale factors straight through the ReLU
+# (ReLU(q·(k_q·s)) = s·ReLU(q·k_q)), so quantization only perturbs the
+# relative ranking by the fp8 rounding of k itself — measured as top-k
+# recall in the tests, never as a numerics break.
+
+
+class RowQuant(NamedTuple):
+    """Per-row fp8 storage for selection-only tensors (indexer keys)."""
+
+    q: jax.Array      # [..., S, c] e4m3
+    scale: jax.Array  # [..., S, 1] fp32
+
+
+def quantize_rows(x: jax.Array) -> RowQuant:
+    """Quantize ``x[..., S, c]`` with one scale per row."""
+    xf = x.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(xf), axis=-1, keepdims=True)
+    s = jnp.maximum(amax, _EPS) / FP8_MAX
+    return RowQuant(q=_to_fp8(xf / s), scale=s)
+
+
+def dequantize_rows(rq: RowQuant) -> jax.Array:
+    """fp32 reference reconstruction ``[..., S, c]``."""
+    return rq.q.astype(jnp.float32) * rq.scale
+
+
+def _fp8_step(q: jax.Array, up: bool) -> jax.Array:
+    """One e4m3 ulp toward +inf (``up``) or -inf. The payload bit pattern
+    is monotone within each sign, so this is a uint8 inc/dec with the
+    zero-crossing special-cased (±0 step to the ±min subnormal). Callers
+    never step past ±448 (the row scale puts amax exactly there, and an
+    exactly-representable value is never stepped)."""
+    b = jax.lax.bitcast_convert_type(q, jnp.uint8)
+    neg = b >= 0x80
+    if up:
+        stepped = jnp.where(neg, b - 1, b + 1)
+        stepped = jnp.where(b == 0x80, jnp.uint8(0x01), stepped)
+    else:
+        stepped = jnp.where(neg, b + 1, b - 1)
+        stepped = jnp.where(b == 0x00, jnp.uint8(0x81), stepped)
+    return jax.lax.bitcast_convert_type(stepped, FP8_DTYPE)
+
+
+def quantize_rows_bound(x: jax.Array, *, upper: bool) -> RowQuant:
+    """Directed-rounding row quantization for tensors that must stay
+    *bounds* (the §13.7 page envelopes): guarantees the f32 dequant
+    (``q * scale``, exactly what the scan computes) is >= x elementwise
+    for ``upper=True`` (<= for lower). Round-to-nearest would pull a
+    stored max/min toward the interior; padding it back costs ~12.5%
+    per coordinate — stepping the payload one ulp outward only where the
+    reconstruction actually violates costs <= 1 ulp on ~half the
+    coordinates instead. Two fix-up passes: the first repairs e4m3
+    rounding, the second the (rare) f32 rounding of q*scale itself."""
+    xf = x.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(xf), axis=-1, keepdims=True)
+    s = jnp.maximum(amax, _EPS) / FP8_MAX
+    q = _to_fp8(xf / s)
+    for _ in range(2):
+        deq = q.astype(jnp.float32) * s
+        need = (deq < xf) if upper else (deq > xf)
+        q = jnp.where(need, _fp8_step(q, upper), q)
+    return RowQuant(q=q, scale=s)

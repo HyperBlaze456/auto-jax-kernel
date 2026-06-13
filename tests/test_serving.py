@@ -286,6 +286,34 @@ def test_mhc_fused_kernels():
                          - mhc.mhc_update_ref(x, comb, post, f)).max()) < 1e-5
 
 
+def test_mhc_update_mix_kernel():
+    """Epilogue-fused mixes emission (HARDWARE_NOTES §13.6): X' must match
+    the plain update, and the emitted mixes must match the eager
+    RMSNorm_row(X') @ w_mix the next half's gate path would compute from
+    an HBM read-back of X' (incl. the storage-dtype rounding)."""
+    ks = jax.random.split(jax.random.PRNGKey(8), 6)
+    B, n, hc, d, n_mix = 2, 12, 4, 256, 24
+    tiles = ServingTiles(mhc_bn=8, interpret=True)  # n % bn != 0 → pads
+    x = jax.random.normal(ks[0], (B, n, hc, d), jnp.float32)
+    comb = jax.nn.softmax(
+        jax.random.normal(ks[1], (B, n, hc, hc), jnp.float32), -1)
+    post = 2 * jax.nn.sigmoid(jax.random.normal(ks[2], (B, n, hc), jnp.float32))
+    f = jax.random.normal(ks[3], (B, n, d), jnp.float32)
+    w_mix = (jax.random.normal(ks[4], (hc * d, n_mix), jnp.float32)
+             * (hc * d) ** -0.5)
+    xp, mixes = mhc.mhc_update_mix(x, comb, post, f, w_mix, tiles=tiles)
+    xp_ref, mixes_ref = mhc.mhc_update_mix_ref(x, comb, post, f, w_mix)
+    assert float(jnp.abs(xp - xp_ref).max()) < 1e-5
+    assert float(jnp.abs(mixes - mixes_ref).max()) < 1e-5
+    # the bf16 storage round-trip the model path exercises
+    xb, fb = x.astype(jnp.bfloat16), f.astype(jnp.bfloat16)
+    xp, mixes = mhc.mhc_update_mix(xb, comb, post, fb, w_mix, tiles=tiles)
+    xp_ref, mixes_ref = mhc.mhc_update_mix_ref(xb, comb, post, fb, w_mix)
+    assert float(jnp.abs(xp.astype(jnp.float32)
+                         - xp_ref.astype(jnp.float32)).max()) < 0.03
+    assert float(jnp.abs(mixes - mixes_ref).max()) < 0.03
+
+
 # ---------------------------------------------------------------------------
 # full model
 # ---------------------------------------------------------------------------
@@ -301,18 +329,39 @@ def small_model():
 
 def test_prefill_prefix_stability(small_model):
     """Causality: extending the sequence must not change earlier rows'
-    cache entries (selection orders matched: n_blk > topk in both)."""
+    cache entries (selection orders matched: n_blk > topk in both).
+
+    The raw SWA cache is a dual-write ring of 2*n_win rows, so only the
+    window positions present in *both* prefills are comparable; compressed
+    entries and indexer keys are position-indexed and checked as prefixes."""
     cfg, tiles, params = small_model
     B, S = 1, 96
-    toks = jax.random.randint(jax.random.PRNGKey(8), (B, 56), 0, cfg.vocab)
-    _, s48 = model.prefill(params, toks[:, :48], cfg,
+    n_a, n_b = 48, 56
+    toks = jax.random.randint(jax.random.PRNGKey(8), (B, n_b), 0, cfg.vocab)
+    _, s48 = model.prefill(params, toks[:, :n_a], cfg,
                            model.init_state(cfg, B, S), tiles=tiles)
-    _, s56 = model.prefill(params, toks[:, :56], cfg,
+    _, s56 = model.prefill(params, toks[:, :n_b], cfg,
                            model.init_state(cfg, B, S), tiles=tiles)
-    for la, lb in zip(s48.caches, s56.caches):
-        a = quant.dequantize_kv(la.swa)[:, :48]
-        b = quant.dequantize_kv(lb.swa)[:, :48]
+    for kind, la, lb in zip(model.layer_schedule(cfg), s48.caches, s56.caches):
+        acfg = cfg.hca if kind == "hca" else cfg.csa
+        m = acfg.m_prime if kind == "hca" else acfg.m
+        n_win = acfg.n_win
+        # ring overlap: positions seen by both prefills' windows
+        lo, hi = n_b - n_win, n_a                      # [lo, hi) overlap
+        slots = jnp.arange(lo, hi) % n_win
+        a = quant.dequantize_kv(la.swa)[:, slots]
+        b = quant.dequantize_kv(lb.swa)[:, slots]
         assert float(jnp.abs(a - b).max()) < 1e-6
+        # compressed entries: blocks completed by the shorter prefill
+        nblk = n_a // m
+        if kind != "swa" and nblk > 0:
+            a = quant.dequantize_kv(la.kc)[:, :nblk]
+            b = quant.dequantize_kv(lb.kc)[:, :nblk]
+            assert float(jnp.abs(a - b).max()) < 1e-6
+        if kind == "csa" and nblk > 0:
+            a = quant.dequantize_rows(la.ki)[:, :nblk]
+            b = quant.dequantize_rows(lb.ki)[:, :nblk]
+            assert float(jnp.abs(a - b).max()) < 1e-6
 
 
 def test_decode_matches_prefill(small_model):

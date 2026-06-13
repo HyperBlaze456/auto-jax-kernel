@@ -140,6 +140,27 @@ class ModelConfig:
     # pattern; afterwards CSA/HCA interleave starting with CSA.
     n_swa_only: int = 2
     intro_kind: str = "swa"      # "swa" (Flash) | "hca" (Pro) for the intro layers
+    # CSA selection granularity (HARDWARE_NOTES §13). 0 = row-exact top-k
+    # over every compressed entry (the default contract). P > 0 = coarse-
+    # to-fine: the indexer scans only per-page summaries (n_blk/P of them)
+    # and selects topk/P pages of P consecutive entries, gathered by the
+    # paged kernel — cutting both the dominant long-context scan bytes and
+    # the gather descriptor count by ~P. Requires csa.topk % P == 0 and
+    # P * csa.m <= csa.n_win (the in-progress page is then always covered
+    # by the raw SWA window, so completed-pages-only selection loses no
+    # reachable context).
+    csa_pages: int = 0
+    # Exact coarse-to-fine (HARDWARE_NOTES §13.7), requires csa_pages > 0.
+    # The page summaries become coordinatewise max/min *envelopes* whose
+    # scores are sound per-page upper bounds; decode rescans the top
+    # `csa_rescan` pages (0 = auto: 2 * topk // P) at row resolution and
+    # takes the row-exact f32 top-k over the candidates. Selection equals
+    # the csa_pages=0 contract whenever the candidate set covers the true
+    # top-k (the certificate the tests assert); the scan still reads only
+    # n_blk/P-sized summaries — 2 caches + a topk-sized rescan instead of
+    # 1 cache, ~2x the mean-summary bytes, still ~P/2x below a full scan.
+    csa_pages_exact: bool = False
+    csa_rescan: int = 0
 
 
 def _flash() -> ModelConfig:

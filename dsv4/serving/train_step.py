@@ -55,6 +55,7 @@ from .model import (
     ModelParams,
     _grouped_o_proj,
     _mhc_gates,
+    _mixes_proj,
     _rope_at,
     layer_schedule,
 )
@@ -242,13 +243,16 @@ def train_forward(
     kinds = layer_schedule(cfg)
 
     def layer_fn(x, lp: TrainLayerParams, li: int):
-        # attention half
-        pre, post, comb = _mhc_gates(x, lp.mhc_attn, cfg, tiles)
+        # attention half (training keeps the eager mixes projection —
+        # the serving-side epilogue fusion is a byte optimization only)
+        pre, post, comb = _mhc_gates(_mixes_proj(x, lp.mhc_attn),
+                                     lp.mhc_attn, cfg, tiles)
         h = mhc_pre_norm_diff(x, pre, tiles=tiles).astype(jnp.bfloat16)
         f = _attn_train(h, lp, kinds[li], cfg, tiles)
         x = mhc_update_diff(x, comb, post, f.astype(x.dtype), tiles=tiles)
         # MoE half
-        pre, post, comb = _mhc_gates(x, lp.mhc_moe, cfg, tiles)
+        pre, post, comb = _mhc_gates(_mixes_proj(x, lp.mhc_moe),
+                                     lp.mhc_moe, cfg, tiles)
         h = mhc_pre_norm_diff(x, pre, tiles=tiles).astype(jnp.bfloat16)
         hf = h.reshape(B * n, cfg.d)
         if li < cfg.moe.n_hash_layers:
