@@ -19,10 +19,13 @@ sink via its closed-form term, mHC scale/base via the sinkhorn custom-vjp
   - ``router_bias``: aux-loss-free selection bias (stop-gradient by
     construction, updated by the load-balancing controller, not SGD);
   - the lightning-indexer parameters (W_IUQ, W_w, indexer-key compressor):
-    top-k *selection* is non-differentiable, and DSv4 trains the indexer
-    with a separate score-distillation objective (paper §2.3.1), not the
-    LM loss. ``train_step`` reports these leaves as zero-grad; the
-    distillation hook is future work.
+    top-k *selection* is non-differentiable, so under the LM loss alone
+    these leaves are zero-grad. DSv4 trains them with a separate
+    score-distillation objective (paper §2.3.1): pass ``distill_weight>0``
+    to ``train_step`` and the indexer learns to rank compressed blocks
+    by the main attention's realized block weights (``_indexer_distill_loss``,
+    a stop-gradient KL). ``distill_weight=0`` (default) keeps the
+    zero-grad contract.
 
 Conventions match the *serving* stack (completed-blocks-only compression,
 causal SWA masking), so ``to_serving_params`` + ``model.prefill`` serve
@@ -62,6 +65,8 @@ from .model import (
 from .moe import MoEParams, route_hash
 from .moe_diff import MoEParamsTrain, moe_forward_local_diff
 from .quant import quantize_weight
+
+_NEG_INF = -1.0e30
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +169,58 @@ def to_serving_params(tp: TrainModelParams, cfg: ModelConfig) -> ModelParams:
 
 
 # ---------------------------------------------------------------------------
+# Indexer score-distillation (paper §2.3.1)
+# ---------------------------------------------------------------------------
+
+
+def _indexer_distill_loss(q, kc, scores, m, c):
+    """KL( main-attention block weights ‖ indexer softmax ), the objective
+    that trains the lightning indexer.
+
+    top-k *selection* is non-differentiable, so under the LM loss the
+    indexer params (W_IUQ, W_w, the ki compressor) get zero gradient. The
+    indexer's job is to rank compressed blocks by how much the *real*
+    attention attends them — so distill toward that: the teacher is the
+    dense block-attention distribution (``softmax_s scale·q·kcᵀ``, mean
+    over heads, **stop-gradient** — the indexer learns from the model, not
+    vice versa), the student is ``softmax_s`` of the indexer scores over
+    the same completed blocks. Gradient flows student→indexer only.
+
+    q  [B, n, n_h, c]  attention queries (roped+normed, as the kernel sees)
+    kc [B, n_full, c]  compressed attention keys (same)
+    scores [B, n, n_full]  indexer scores (−inf at non-causal blocks)
+    Returns a scalar mean KL over tokens with ≥1 completed block.
+    """
+    B, n, n_h, _ = q.shape
+    n_full = kc.shape[1]
+    scale = float(c) ** -0.5
+    sidx = jnp.arange(n_full)
+    t = jnp.arange(n)
+    mask = sidx[None, :] < (t[:, None] // m)             # [n, n_full]
+    neg = jnp.float32(_NEG_INF)
+
+    tl = scale * jnp.einsum("bnhc,bsc->bnhs",
+                            q.astype(jnp.float32), kc.astype(jnp.float32))
+    tl = jnp.where(mask[None, :, None, :], tl, neg)
+    teacher = jax.nn.softmax(tl, axis=-1).mean(axis=2)   # [B, n, n_full]
+    teacher = jax.lax.stop_gradient(teacher)
+
+    sl = jnp.where(mask[None], scores.astype(jnp.float32), neg)
+    logq = jax.nn.log_softmax(sl, axis=-1)               # [B, n, n_full]
+    kl = (teacher * (jnp.log(teacher + 1e-9) - logq)).sum(-1)   # [B, n]
+
+    valid = (t // m) > 0                                 # ≥1 completed block
+    kl = kl * valid[None].astype(jnp.float32)            # finite mask, no NaN
+    return kl.sum() / jnp.maximum(valid.sum() * B, 1).astype(jnp.float32)
+
+
+# ---------------------------------------------------------------------------
 # Differentiable attention sublayer (prefill-shaped, serving conventions)
 # ---------------------------------------------------------------------------
 
 
 def _attn_train(h, lp: TrainLayerParams, kind: str, cfg: ModelConfig,
-                tiles: ServingTiles):
+                tiles: ServingTiles, distill: bool = False):
     B, n, d = h.shape
     p = lp.attn
     acfg = cfg.hca if kind == "hca" else cfg.csa
@@ -197,6 +248,7 @@ def _attn_train(h, lp: TrainLayerParams, kind: str, cfg: ModelConfig,
         kc = jnp.zeros((B, 1, c), h.dtype)
 
     # Selection (non-diff indices; serving conventions).
+    scores = None
     if kind == "csa":
         ki = eager.csa_compress(h[:, : n_full * m], p.W_aIK, p.W_bIK,
                                 p.W_aIZ, p.W_bIZ, p.B_aI, p.B_bI, m)
@@ -215,9 +267,15 @@ def _attn_train(h, lp: TrainLayerParams, kind: str, cfg: ModelConfig,
     q = eager.rms_norm(_rope_at(
         ((h @ p.W_DQ) @ p.W_UQ).reshape(B, n, n_h, c), positions, rd))
 
+    # Indexer distillation: only CSA layers have a lightning indexer, and
+    # only when a completed block exists to rank (paper §2.3.1).
+    aux = jnp.float32(0.0)
+    if distill and kind == "csa" and n_full > 0:
+        aux = _indexer_distill_loss(q, kc, scores, m, acfg.c)
+
     o = sparse_mqa_train(q, kc, topk, k_swa, positions, p.attn_sink,
                          n_win=acfg.n_win, tiles=tiles)
-    return _grouped_o_proj(o.astype(h.dtype), lp.w_o1, lp.w_o2, cfg.g)
+    return _grouped_o_proj(o.astype(h.dtype), lp.w_o1, lp.w_o2, cfg.g), aux
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +290,11 @@ def train_forward(
     *,
     tiles: ServingTiles | None = None,
     remat: bool = True,
-) -> jax.Array:
-    """Differentiable full-stack forward → logits ``[B, n, vocab]``."""
+    distill: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Differentiable full-stack forward → ``(logits [B, n, vocab],
+    distill_loss)``. ``distill_loss`` is the summed indexer-distillation
+    KL over CSA layers (0.0 when ``distill`` is False)."""
     if tiles is None:
         tiles = tiles_for()
     B, n = token_ids.shape
@@ -242,13 +303,14 @@ def train_forward(
 
     kinds = layer_schedule(cfg)
 
-    def layer_fn(x, lp: TrainLayerParams, li: int):
+    def layer_fn(carry, lp: TrainLayerParams, li: int):
+        x, aux = carry
         # attention half (training keeps the eager mixes projection —
         # the serving-side epilogue fusion is a byte optimization only)
         pre, post, comb = _mhc_gates(_mixes_proj(x, lp.mhc_attn),
                                      lp.mhc_attn, cfg, tiles)
         h = mhc_pre_norm_diff(x, pre, tiles=tiles).astype(jnp.bfloat16)
-        f = _attn_train(h, lp, kinds[li], cfg, tiles)
+        f, a = _attn_train(h, lp, kinds[li], cfg, tiles, distill=distill)
         x = mhc_update_diff(x, comb, post, f.astype(x.dtype), tiles=tiles)
         # MoE half
         pre, post, comb = _mhc_gates(_mixes_proj(x, lp.mhc_moe),
@@ -261,15 +323,18 @@ def train_forward(
             ig = None
         f = moe_forward_local_diff(hf, lp.moe, cfg.moe, tiles=tiles,
                                    idx_gates=ig).reshape(B, n, cfg.d)
-        return mhc_update_diff(x, comb, post, f.astype(x.dtype), tiles=tiles)
+        x = mhc_update_diff(x, comb, post, f.astype(x.dtype), tiles=tiles)
+        return (x, aux + a)
 
+    carry = (x, jnp.float32(0.0))
     for li, lp in enumerate(params.layers):
         fn = (jax.checkpoint(layer_fn, static_argnums=(2,)) if remat
               else layer_fn)
-        x = fn(x, lp, li)
+        carry = fn(carry, lp, li)
+    x, distill_loss = carry
 
     h_out = eager.rms_norm(x.astype(jnp.float32).mean(axis=2))
-    return h_out @ params.head
+    return h_out @ params.head, distill_loss
 
 
 def lm_loss(
@@ -279,13 +344,21 @@ def lm_loss(
     *,
     tiles: ServingTiles | None = None,
     remat: bool = True,
+    distill_weight: float = 0.0,
 ) -> jax.Array:
-    """Next-token cross-entropy (mean over B x (n-1) positions)."""
-    logits = train_forward(params, token_ids, cfg, tiles=tiles, remat=remat)
+    """Next-token cross-entropy (mean over B x (n-1) positions), plus
+    ``distill_weight`` × the indexer score-distillation KL (paper §2.3.1).
+
+    With ``distill_weight == 0`` (default) the indexer params (W_IUQ, W_w,
+    ki compressor) stay zero-grad — top-k selection is non-differentiable;
+    a positive weight is what trains them, via a path independent of the
+    LM cross-entropy."""
+    logits, distill = train_forward(params, token_ids, cfg, tiles=tiles,
+                                    remat=remat, distill=distill_weight > 0)
     logp = jax.nn.log_softmax(logits[:, :-1].astype(jnp.float32), axis=-1)
     tgt = token_ids[:, 1:]
     nll = -jnp.take_along_axis(logp, tgt[..., None], axis=-1)[..., 0]
-    return nll.mean()
+    return nll.mean() + distill_weight * distill
 
 
 def train_step(
@@ -295,11 +368,17 @@ def train_step(
     *,
     tiles: ServingTiles | None = None,
     remat: bool = True,
+    distill_weight: float = 0.0,
 ):
     """One step: returns ``(loss, grads)`` with grads matching the
     ``TrainModelParams`` pytree. Optimizer application is the caller's
     business (the paper uses Muon for matrices + AdamW for embeddings/
-    norms; both consume exactly this grad tree)."""
+    norms; both consume exactly this grad tree).
+
+    ``distill_weight > 0`` adds the indexer score-distillation objective,
+    making the lightning-indexer leaves trainable (W_IUQ, W_w, the ki
+    compressor) — otherwise they are principled zero-grad."""
     return jax.value_and_grad(
-        lambda p: lm_loss(p, token_ids, cfg, tiles=tiles, remat=remat)
+        lambda p: lm_loss(p, token_ids, cfg, tiles=tiles, remat=remat,
+                          distill_weight=distill_weight)
     )(params)

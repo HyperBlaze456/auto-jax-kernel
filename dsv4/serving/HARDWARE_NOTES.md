@@ -449,8 +449,7 @@ byte cuts, and the SWA ring buffer — are DONE; they became §13.)
 2. Sort-by-destination two-pass dK reduction (kills the contribution
    buffer round trip in attention bwd).
 3. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
-4. Indexer score-distillation objective (paper §2.3.1) so indexer
-   params train; today they are principled zero-grad under the LM loss.
+4. ~~Indexer score-distillation objective~~ — DONE, became §13.9.
 5. EP training wiring (shard_map a2a autodiffs natively; substitute
    grouped_ffn into moe_forward_ep when multi-host training lands).
 6. ~~A Pallas valid-prefix indexer-scan kernel~~ — DONE, became §13.5.
@@ -744,3 +743,40 @@ dev/test scale; a searchsorted/bitmap reduction is the production
 refinement (the kernel itself is production-shaped). Paged prefill
 (`csa_pages>0`) keeps its page-slab kernel; only the per-row gather
 prefill is batched.
+
+### 13.9 Indexer score-distillation (`train_step.py`, paper §2.3.1)
+
+The lightning indexer picks which compressed blocks attention sees
+(top-k of its scores). But **top-k selection is non-differentiable** —
+the indices are discrete — so under the LM loss the indexer's own
+parameters (W_IUQ, W_w, the ki compressor) get *exactly zero* gradient.
+The forward already stop-gradients the selection (`stop_gradient(
+topk_indices(scores))`), and there is no other path from those weights
+to the loss. Left alone they never move from init: the selector is
+untrained, and a model that can't learn *what to retrieve* wastes the
+whole sparse-attention machinery. (W_DQ is the exception — it is shared
+with the attention query projection, so it already trains on the LM
+loss.)
+
+The paper's fix is distillation: teach the indexer to rank blocks the
+way the *real* attention weights them. `_indexer_distill_loss` builds,
+per CSA layer, the teacher = dense block-attention distribution
+`softmax_s(scale·q·kcᵀ)` averaged over heads and **stop-gradient**ed
+(the indexer learns from the model, not the reverse), and the student =
+`softmax` of the indexer scores over the same completed blocks; the loss
+is their KL. Gradient flows student→indexer only, so the LM objective is
+untouched and the selector learns to predict high-attention blocks —
+exactly the signal top-k needs.
+
+Wiring: `train_step(..., distill_weight>0)` adds `distill_weight ·
+Σ_layers KL`. The teacher's dense `q·kcᵀ` over all completed blocks is
+O(n·n_blk) per CSA layer — affordable in training, gated off entirely
+when `distill_weight=0` (the default, which is **bit-identical** to the
+pre-distillation path and keeps the zero-grad contract). Masking uses a
+finite −1e30 (not −inf) and a clean multiplicative token mask so
+zero-completed-block tokens never inject NaN.
+
+Tests: `test_indexer_distillation_trains_selector` (W_IUQ/W_w/ki-
+compressor become nonzero-grad; the KL term is finite and ≥ 0),
+`test_distillation_off_leaves_indexer_zero_grad` (the default path is
+unchanged, loss bit-identical, indexer still zero-grad).

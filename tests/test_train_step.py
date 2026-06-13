@@ -58,8 +58,9 @@ def test_all_grads_finite_and_trainables_nonzero(setup, step_result):
     ]
     for g in trainables:
         assert float(jnp.abs(g).max()) > 0.0
-    # principled zero-grads: selection-only bias; indexer trains via its
-    # own distillation objective, not the LM loss.
+    # principled zero-grads under the LM loss alone (default distill_weight
+    # =0): selection-only bias; indexer trains via its own distillation
+    # objective (test_indexer_distillation_trains_selector), not the LM loss.
     for lg in grads.layers:
         assert float(jnp.abs(lg.moe.router_bias).max()) == 0.0
     assert float(jnp.abs(l1.attn.W_IUQ).max()) == 0.0
@@ -94,3 +95,36 @@ def test_grads_deterministic(setup, step_result):
     np.testing.assert_array_equal(np.asarray(loss_a), np.asarray(loss_b))
     for a, b in zip(jax.tree.leaves(grads_a), jax.tree.leaves(grads_b)):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_indexer_distillation_trains_selector(setup):
+    """Indexer score-distillation (paper §2.3.1, train_step distill_weight>0):
+    the lightning-indexer leaves that are zero-grad under the LM loss
+    (W_IUQ, W_w, the ki compressor) must receive nonzero gradient, via a
+    KL toward the main attention's block weights — and the distill term
+    itself must be finite and non-negative (a KL). The CSA query/compressor
+    paths (W_DQ shared with attention) stay trainable too."""
+    cfg, tiles, params, toks = setup
+    loss, grads = ts.train_step(params, toks, cfg, tiles=tiles, remat=True,
+                                distill_weight=1.0)
+    assert bool(jnp.isfinite(loss))
+    for g in jax.tree.leaves(grads):
+        assert bool(jnp.isfinite(g).all())
+    l1 = grads.layers[1]                          # a CSA layer
+    for name in ("W_IUQ", "W_w", "W_aIK", "W_bIK"):
+        assert float(jnp.abs(getattr(l1.attn, name)).max()) > 0.0, name
+    # the distillation term in isolation: finite, non-negative (KL)
+    _, distill = ts.train_forward(params, toks, cfg, tiles=tiles,
+                                  remat=False, distill=True)
+    assert bool(jnp.isfinite(distill)) and float(distill) >= -1e-4
+
+
+def test_distillation_off_leaves_indexer_zero_grad(setup):
+    """distill_weight=0 is bit-identical to the pre-distillation path: the
+    indexer leaves stay exactly zero-grad and the loss is unchanged."""
+    cfg, tiles, params, toks = setup
+    l_off, g_off = ts.train_step(params, toks, cfg, tiles=tiles, remat=True,
+                                 distill_weight=0.0)
+    l_base, _ = ts.train_step(params, toks, cfg, tiles=tiles, remat=True)
+    np.testing.assert_array_equal(np.asarray(l_off), np.asarray(l_base))
+    assert float(jnp.abs(g_off.layers[1].attn.W_IUQ).max()) == 0.0
