@@ -68,6 +68,7 @@ from .. import eager
 from ..kernel_config import KernelConfig
 from ..kernel_v2 import mhc_sinkhorn_kernel_v2
 from .attention import sparse_mqa_gathered
+from .attention_blocked import sparse_mqa_gathered_blocked
 from .attention_paged import sparse_mqa_paged
 from .indexer_scan import indexer_scores_decode, indexer_ub_scores_decode
 from .config import ModelConfig, ServingTiles, tiles_for
@@ -585,6 +586,14 @@ def _attn_prefill(h, lp: LayerParams, cfg: ModelConfig, cache: LayerCache,
         o = sparse_mqa_paged(q, cache.kc, topk_pg, bound, swa_kern, positions,
                              p.attn_sink, page=cfg.csa_pages,
                              n_win=acfg.n_win, rope_dim=rd, tiles=tiles)
+    elif tiles.attn_bq > 1:
+        # q-block batched gather: one top-k-union + one SWA-span DMA shared
+        # across BQ prefill tokens (HARDWARE_NOTES §13.8). Numerically the
+        # per-token kernel; prefill positions are contiguous from 0.
+        o = sparse_mqa_gathered_blocked(q, cache.kc, topk, swa_kern,
+                                        p.attn_sink, n_win=acfg.n_win,
+                                        rope_dim=rd, bq=tiles.attn_bq,
+                                        tiles=tiles)
     else:
         o = sparse_mqa_gathered(q, cache.kc, topk, swa_kern, positions,
                                 p.attn_sink, n_win=acfg.n_win, rope_dim=rd,

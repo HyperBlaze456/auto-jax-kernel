@@ -445,7 +445,7 @@ Readings:
 (Items 6–8 of the original list — paged selection wiring, indexer-scan
 byte cuts, and the SWA ring buffer — are DONE; they became §13.)
 
-1. Prefill q-block gather batching (splash-style top-k union).
+1. ~~Prefill q-block gather batching~~ — DONE, became §13.8.
 2. Sort-by-destination two-pass dK reduction (kills the contribution
    buffer round trip in attention bwd).
 3. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
@@ -692,3 +692,55 @@ full-budget selection ≡ row-exact oracle at prefix lengths including
 page fractions, the certificate implication (iid) and certificate
 exactness (clustered), plus the full-model gold/determinism twins under
 `csa_pages_exact=True`.
+
+### 13.8 Q-block batched prefill gather (`attention_blocked.py`)
+
+§13.5–13.7 cut the decode budget; this one cuts prefill. The per-token
+gather kernel (grid (B, T)) re-issues, for every query token, a DMA
+gather of its top-k rows + its n_win SWA window. Consecutive prefill
+tokens overlap heavily — windows slide by one row, and locally-smooth
+attention makes their top-k sets nearly identical — so the per-token
+path pays for the same HBM rows T times over.
+
+`sparse_mqa_gathered_blocked` batches BQ consecutive query tokens into
+one program (`tiles.attn_bq`, default 8):
+
+- **top-k union, gathered once.** The block's BQ·k selected indices are
+  deduplicated into a front-packed union of D distinct rows; the chunk
+  DMAs run under `pl.when(chunk_start < D)` (the §13.5 trick), so the
+  gather moves D rows — duplicate elimination is a real bandwidth cut
+  (D ≈ k–2k vs the BQ·k the per-token path issues). A per-token
+  membership mask restricts each token to *exactly* its own top-k, so
+  the math is the per-token kernel's, only the DMA is shared.
+- **SWA span, gathered once.** The block's windows together cover the
+  contiguous slab [p0−n_win+1, p0+BQ−1] — n_win+BQ−1 rows read once
+  instead of BQ overlapping n_win-row reads; per-token positional
+  masking recovers each window.
+
+**Exactness, and why it's opt-in.** K_union = round_up(BQ·k) ≥ the true
+union, so no selected row is ever dropped and each token attends exactly
+its top-k — the *selection* is identical to the per-token kernel. But
+the flash PV accumulator sums a token's rows in a different grouping
+(over the K_union union + span-row tiles, vs the per-token k + n_win
+tiles), so the result differs by floating-point reassociation: ~2 ulp
+per layer (asserted: blocked ≡ per-token to 2e-2 per attention output;
+the union builder is checked exactly). That drift is below any trained
+signal, but the **decode≡prefill gold test rests on a bit-twin** —
+decode is inherently per-token (T=1, no block to amortize), so a blocked
+prefill is not its exact twin, and on an untrained random net the
+per-layer ulp noise amplifies across layers past the 5e-2 gold bound.
+
+So `attn_bq` defaults to **1** (per-token, exact twin — all gold/full-
+model tests run here unchanged); `attn_bq > 1` is the opt-in prefill-
+throughput mode, for serving points where prefill gather bandwidth
+matters more than bit-identity with the decode path. Validated by the
+standalone blocked≡per-token and union-builder tests.
+
+Finite-safety: gather buffers are zero-initialized, so chunks skipped by
+the pl.when guard feed 0 (not stale NaN) into the masked PV dot.
+
+Scope: the membership preamble is O(BQ·k·K_union)/block — fine at
+dev/test scale; a searchsorted/bitmap reduction is the production
+refinement (the kernel itself is production-shaped). Paged prefill
+(`csa_pages>0`) keeps its page-slab kernel; only the per-row gather
+prefill is batched.

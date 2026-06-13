@@ -477,3 +477,85 @@ def test_exact_decode_is_deterministic(exact_model):
                                               state, tiles=tiles)
         outs.append(logits)
     np.testing.assert_array_equal(np.asarray(outs[0]), np.asarray(outs[1]))
+
+
+# ---------------------------------------------------------------------------
+# 6. q-block batched prefill gather (HARDWARE_NOTES §13.8)
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_union_builder():
+    """The dedup/compact preamble: union must be the distinct non-negative
+    selected blocks (front-packed, -1 padded), D their count, and
+    membership[t,j] iff union[j] is in token t's top-k."""
+    from dsv4.serving.attention_blocked import _build_union
+    B, t_pad, k, bq = 1, 8, 4, 4          # 2 blocks of 4 tokens
+    topk = jnp.array([[[0, 2, 2, -1], [2, 5, 0, -1], [1, 1, 1, 1],
+                       [0, 3, 5, 7],
+                       [9, 9, -1, -1], [8, 9, 10, 11], [8, -1, -1, -1],
+                       [12, 13, 8, 9]]], jnp.int32)
+    k_union = bq * k
+    union, d, memb = _build_union(topk, bq, k_union)
+    union, d, memb = map(np.asarray, (union, d, memb))
+    # block 0 distinct = {0,1,2,3,5,7} -> 6 ; block 1 = {8,9,10,11,12,13} -> 6
+    assert list(d[0]) == [6, 6]
+    for nb in range(2):
+        present = set(int(x) for x in union[0, nb] if x >= 0)
+        ref = set(int(x) for x in topk[0, nb * bq:(nb + 1) * bq].reshape(-1)
+                  if x >= 0)
+        assert present == ref
+        for t in range(bq):
+            tk = set(int(x) for x in topk[0, nb * bq + t] if x >= 0)
+            for j in range(k_union):
+                u = int(union[0, nb, j])
+                assert bool(memb[0, nb, t, j]) == (u >= 0 and u in tk)
+
+
+def test_blocked_matches_per_token():
+    """Block-batched prefill gather == the per-token kernel (same rows,
+    same per-token masking; differs only by flash reassociation)."""
+    from dsv4.serving import attention
+    from dsv4.serving.attention_blocked import sparse_mqa_gathered_blocked
+    ks = jax.random.split(jax.random.PRNGKey(70), 5)
+    B, T, n_h, c, r = 2, 12, 4, 128, 64
+    S_c, S_r, k, n_win = 32, 64, 8, 16
+    q = jax.random.normal(ks[0], (B, T, n_h, c), jnp.float32)
+    kc = quant.quantize_kv(jax.random.normal(ks[1], (B, S_c, c), jnp.float32), r)
+    swa = quant.quantize_kv(jax.random.normal(ks[2], (B, S_r, c), jnp.float32), r)
+    sink = jax.random.normal(ks[3], (n_h,), jnp.float32) * 0.5
+    # realistic top-k: distinct indices per token (as eager.topk_indices
+    # emits), causal so block s is selectable only for s < i//2 + 1.
+    sc = jax.random.normal(ks[4], (B, T, S_c), jnp.float32)
+    causal = jnp.arange(S_c)[None, None, :] < (jnp.arange(T)[None, :, None] // 2 + 1)
+    topk = eager.topk_indices(jnp.where(causal, sc, -jnp.inf), k)
+    pos = jnp.broadcast_to(jnp.arange(T, dtype=jnp.int32), (B, T))
+    tiles = ServingTiles(attn_chunk=4, interpret=True)
+    ref = attention.sparse_mqa_gathered(q, kc, topk, swa, pos, sink,
+                                        n_win=n_win, rope_dim=r, tiles=tiles)
+    for bq in (1, 4, 6):
+        got = sparse_mqa_gathered_blocked(q, kc, topk, swa, sink, n_win=n_win,
+                                          rope_dim=r, bq=bq, tiles=tiles)
+        assert got.shape == ref.shape
+        err = float(jnp.abs(got.astype(jnp.float32)
+                            - ref.astype(jnp.float32)).max())
+        assert err < 2e-2, f"bq={bq}: max err {err}"
+
+
+def test_blocked_prefill_full_model_runs_deterministic():
+    """The wired blocked path (attn_bq>1) on the full model: finite logits,
+    correct shape, and run-to-run determinism. (Numeric agreement with the
+    per-token path is the standalone blocked≡per-token test; blocked is an
+    opt-in prefill mode, not the decode bit-twin — see §13.8.)"""
+    cfg = SMALL_MODEL
+    params = model.init_params(jax.random.PRNGKey(7), cfg)
+    toks = jax.random.randint(jax.random.PRNGKey(5), (2, 40), 0, cfg.vocab)
+    for bq in (4, 8):
+        tiles = ServingTiles(gemm_tm=16, attn_chunk=4, mhc_bn=8,
+                             attn_bq=bq, interpret=True)
+        l1, _ = model.prefill(params, toks, cfg,
+                              model.init_state(cfg, 2, 64), tiles=tiles)
+        l2, _ = model.prefill(params, toks, cfg,
+                              model.init_state(cfg, 2, 64), tiles=tiles)
+        assert l1.shape == (2, 40, cfg.vocab)
+        assert bool(jnp.isfinite(l1).all()), f"bq={bq}"
+        np.testing.assert_array_equal(np.asarray(l1), np.asarray(l2))

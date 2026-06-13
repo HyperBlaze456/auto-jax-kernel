@@ -113,6 +113,15 @@ class ServingTiles:
     gemm_tm: int = 128
     # Gather attention: top-k rows fetched per DMA wave.
     attn_chunk: int = 128
+    # Prefill q-block batching: query tokens per program. The block shares
+    # one top-k-union gather + one SWA-span gather across its tokens
+    # (HARDWARE_NOTES §13.8). 1 = the per-token kernel (no batching), the
+    # default — it is the exact bit-twin of decode, which the decode≡prefill
+    # gold test rests on. attn_bq > 1 is an opt-in prefill-throughput mode:
+    # numerically the per-token kernel up to flash PV-reduction grouping
+    # (different union/span tiling), so it drifts from the decode twin by
+    # per-layer reassociation — fine for prefill bandwidth, not bit-exact.
+    attn_bq: int = 1
     # mHC fused kernels: tokens per program.
     mhc_bn: int = 128
     # Run all pallas_calls in interpret mode (CPU dev / tests).
