@@ -83,6 +83,11 @@ class TpuSpec:
     num_cores: int = 1       # 2 for megacore parts; 1 otherwise
     lane_size: int = 128     # VPU lane width (BS must be a multiple of this)
     sublane_size: int = 8    # second-minor alignment requirement
+    # Native fp8 (e4m3) MXU dots at ~2x the bf16 rate (v6e+ / v7). When
+    # False the fp8 GEMM upcasts e4m3->bf16 before the dot — bit-exact
+    # (e4m3 is a subset of bf16), only slower. Drives ServingTiles.
+    # compute_upcast (serving/config.py).
+    native_fp8: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,8 +122,9 @@ TPU_SPECS: dict[str, TpuSpec] = {
     "v4":  TpuSpec("v4",  vmem_bytes=32 * MiB, num_cores=1),
     "v5e": TpuSpec("v5e", vmem_bytes=48 * MiB, num_cores=1),
     "v5p": TpuSpec("v5p", vmem_bytes=64 * MiB, num_cores=2),
-    "v6e": TpuSpec("v6e", vmem_bytes=32 * MiB, num_cores=1),
-    "v6p": TpuSpec("v6p", vmem_bytes=64 * MiB, num_cores=2),
+    # v6e+ add the native fp8 MXU path (2x rate over the bf16-upcast dot).
+    "v6e": TpuSpec("v6e", vmem_bytes=32 * MiB, num_cores=1, native_fp8=True),
+    "v6p": TpuSpec("v6p", vmem_bytes=64 * MiB, num_cores=2, native_fp8=True),
     # Dev fallback for CPU / unknown backends. ``lane_size=1`` disables
     # the VPU-alignment requirement so a sub-128 head dim ``c`` traces
     # through pallas_call(interpret=True) without tripping the

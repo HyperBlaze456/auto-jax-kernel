@@ -176,12 +176,14 @@ def moe_forward_local(
     cfg: MoEConfig,
     *,
     tiles: ServingTiles,
-    compute_upcast: bool = True,
+    compute_upcast: bool | None = None,
 ) -> jax.Array:
     """All experts resident on this device. Tokens are quantized **once**
     (the fp8 payload is reused by all top-k replicas and the shared
     expert), sorted by expert, pushed through the fused expert GEMMs, and
     combined with a fixed-order segment-sum."""
+    if compute_upcast is None:
+        compute_upcast = tiles.compute_upcast
     m, d = x.shape
     e, topk = cfg.n_routed, cfg.topk
     p = m * topk
@@ -230,7 +232,7 @@ def moe_forward_ep(
     n_waves: int,
     capacity: int,             # slots per (src, dst, wave) lane
     tiles: ServingTiles,
-    compute_upcast: bool = True,
+    compute_upcast: bool | None = None,
 ) -> jax.Array:
     """Runs *inside* ``shard_map`` over ``axis_name``. Expert weights are
     sharded ``E_local = E / ep_size`` per device; tokens stay with their
@@ -240,6 +242,8 @@ def moe_forward_ep(
     Waves are independent dependency chains; their a2a's overlap with
     neighbouring waves' GEMMs under XLA's latency-hiding scheduler.
     """
+    if compute_upcast is None:
+        compute_upcast = tiles.compute_upcast
     m, d = x.shape
     e, topk = cfg.n_routed, cfg.topk
     e_local = e // ep_size

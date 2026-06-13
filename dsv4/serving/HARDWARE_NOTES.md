@@ -448,7 +448,7 @@ byte cuts, and the SWA ring buffer — are DONE; they became §13.)
 1. ~~Prefill q-block gather batching~~ — DONE, became §13.8.
 2. Sort-by-destination two-pass dK reduction (kills the contribution
    buffer round trip in attention bwd).
-3. Native-fp8 MXU dots on v6e+ (`compute_upcast=False`) + tm autotune.
+3. ~~Native-fp8 MXU dots on v6e+ + tm autotune~~ — DONE, became §13.10.
 4. ~~Indexer score-distillation objective~~ — DONE, became §13.9.
 5. EP training wiring (shard_map a2a autodiffs natively; substitute
    grouped_ffn into moe_forward_ep when multi-host training lands).
@@ -780,3 +780,35 @@ Tests: `test_indexer_distillation_trains_selector` (W_IUQ/W_w/ki-
 compressor become nonzero-grad; the KL term is finite and ≥ 0),
 `test_distillation_off_leaves_indexer_zero_grad` (the default path is
 unchanged, loss bit-identical, indexer still zero-grad).
+
+### 13.10 Native-fp8 MXU dots, generation-resolved (`config.py`)
+
+The grouped fp8 GEMM (`gemm_fp8`, the MoE expert path) already had a
+`compute_upcast` knob: True upcasts the e4m3 operands to bf16 before the
+MXU dot, False feeds them to the MXU's **native fp8 path** (v6e+/v7,
+~2× the bf16 rate). The two are **bit-identical** — e4m3 is a subset of
+bf16, both accumulate in f32, so the products match exactly (verified on
+CPU: max abs diff 0.0, `test_native_fp8_matches_upcast`). That bit-
+exactness is what lets one kernel source serve every generation with no
+numerics fork. But nothing *selected* the fast path: the knob defaulted
+True everywhere, so even v6e/v7 paid the upcast.
+
+This wires it to the hardware: `TpuSpec` gains `native_fp8` (True for
+v6e/v6p/v7), `ServingTiles` gains `compute_upcast`, and `tiles_for` sets
+`compute_upcast = not spec.native_fp8`. The MoE entry points
+(`moe_forward_local`, `moe_forward_ep`, `moe_forward_local_diff`) default
+the flag to None and read it from `tiles`, so it flows automatically;
+explicit callers (tests) can still override. v6e+/v7 now take the 2×
+fp8 MXU rate on the dominant MoE matmuls; v5e/v5p keep the upcast.
+(Attention dots are unaffected — that kernel dequantizes K to bf16 in
+VMEM by design, §attention.py.)
+
+`tm` autotune: `_autotune_gemm_tm(spec)` keeps the VMEM-fit ladder
+(256 on ≥64 MiB parts, else 128). A true autotune times {128,256,512}
+on-device per expert shape — the kernel already takes `tm` as a closure
+arg, so it is a drop-in once hardware is available; the static ladder is
+the portable default.
+
+Tests: native ≡ upcast bit-exact through the full MoE path (and the
+tiles default flows), and `tiles_for` resolves `compute_upcast` per
+generation.

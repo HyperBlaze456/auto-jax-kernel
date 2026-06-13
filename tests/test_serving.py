@@ -232,6 +232,37 @@ def test_moe_hash_routing(moe_setup):
     assert float(jnp.abs(out - ref).max() / jnp.abs(ref).max()) < 5e-2
 
 
+def test_native_fp8_matches_upcast(moe_setup):
+    """The §13.10 'no numerics fork' claim: the native-fp8 MXU dot
+    (compute_upcast=False, v6e+/v7) is bit-identical to the bf16-upcast
+    dot (e4m3 is a subset of bf16), through the full MoE fp8 path."""
+    import dataclasses
+    x, params, cfg, tiles = moe_setup
+    idx, gates = moe.route(x, params, cfg)
+    up = moe.moe_forward_local(x, idx, gates, params, cfg, tiles=tiles,
+                               compute_upcast=True)
+    native = moe.moe_forward_local(x, idx, gates, params, cfg, tiles=tiles,
+                                   compute_upcast=False)
+    np.testing.assert_array_equal(np.asarray(up), np.asarray(native))
+    # and the tiles default flows: compute_upcast=None reads tiles
+    t_native = dataclasses.replace(tiles, compute_upcast=False)
+    flowed = moe.moe_forward_local(x, idx, gates, params, cfg, tiles=t_native)
+    np.testing.assert_array_equal(np.asarray(flowed), np.asarray(native))
+
+
+def test_tiles_for_resolves_native_fp8():
+    """tiles_for maps TpuSpec.native_fp8 → compute_upcast (upcast on parts
+    without native fp8, native dot on v6e+)."""
+    from dsv4.kernel_config import TPU_SPECS
+    from dsv4.serving.config import tiles_for
+    for name in ("v4", "v5e", "v5p", "v6e", "v6p"):
+        spec = TPU_SPECS[name]
+        t = tiles_for(spec, interpret=True)
+        assert t.compute_upcast == (not spec.native_fp8), name
+    assert tiles_for(TPU_SPECS["v5e"], interpret=True).compute_upcast is True
+    assert tiles_for(TPU_SPECS["v6e"], interpret=True).compute_upcast is False
+
+
 @pytest.mark.skipif(jax.device_count() < 2, reason="needs >=2 devices "
                     "(run with XLA_FLAGS=--xla_force_host_platform_device_count=4)")
 def test_moe_ep_matches_local(moe_setup):

@@ -124,6 +124,10 @@ class ServingTiles:
     attn_bq: int = 1
     # mHC fused kernels: tokens per program.
     mhc_bn: int = 128
+    # fp8 GEMM compute path: True upcasts e4m3->bf16 before the MXU dot
+    # (every generation; bit-exact), False uses the native fp8 MXU dot
+    # (v6e+/v7, ~2x rate). Resolved from TpuSpec.native_fp8 by tiles_for.
+    compute_upcast: bool = True
     # Run all pallas_calls in interpret mode (CPU dev / tests).
     interpret: bool = False
 
@@ -232,10 +236,26 @@ def tiles_for(spec: TpuSpec | None = None, *, interpret: bool | None = None) -> 
         # Non-TPU host: interpret mode, tiles small enough for fast tests.
         return ServingTiles(gemm_tm=128, attn_chunk=8, mhc_bn=8,
                             interpret=True if interpret is None else interpret)
-    big_vmem = spec.vmem_bytes >= 64 * 1024 * 1024
     return ServingTiles(
-        gemm_tm=256 if big_vmem else 128,
+        gemm_tm=_autotune_gemm_tm(spec),
         attn_chunk=128,
         mhc_bn=128,
+        # Native fp8 MXU on v6e+/v7 (2x rate, bit-exact vs the bf16-upcast
+        # dot); upcast on parts without it. One kernel source, no fork.
+        compute_upcast=not spec.native_fp8,
         interpret=False if interpret is None else interpret,
     )
+
+
+def _autotune_gemm_tm(spec: TpuSpec) -> int:
+    """Pick the grouped-GEMM m-tile for a part.
+
+    Larger ``tm`` amortizes the per-m-tile weight stream (full-N expert
+    tiles reload all of W per m-tile), so it is bound only by VMEM: the
+    working set is ``tm·(K+2·N)`` fp8 + a ``tm·N`` f32 accumulator, doubled
+    for the K/N double buffers. This is a static VMEM-fit ladder; a true
+    autotune would time {128,256,512} on-device per expert shape and cache
+    the winner (the kernel already takes ``tm`` as a closure arg, so the
+    search is a drop-in — deferred, needs hardware)."""
+    big_vmem = spec.vmem_bytes >= 64 * 1024 * 1024
+    return 256 if big_vmem else 128

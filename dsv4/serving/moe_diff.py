@@ -67,9 +67,11 @@ def moe_forward_local_diff(
     *,
     tiles: ServingTiles,
     idx_gates: tuple[jax.Array, jax.Array] | None = None,  # hash-routing hook
-    compute_upcast: bool = True,
+    compute_upcast: bool | None = None,
 ) -> jax.Array:
     """Training-path MoE forward; fully differentiable via ``jax.grad``."""
+    if compute_upcast is None:
+        compute_upcast = tiles.compute_upcast
     m, d = x.shape
     e, topk = cfg.n_routed, cfg.topk
     if idx_gates is None:
