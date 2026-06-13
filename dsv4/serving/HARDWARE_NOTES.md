@@ -450,8 +450,7 @@ byte cuts, and the SWA ring buffer — are DONE; they became §13.)
    buffer round trip in attention bwd).
 3. ~~Native-fp8 MXU dots on v6e+ + tm autotune~~ — DONE, became §13.10.
 4. ~~Indexer score-distillation objective~~ — DONE, became §13.9.
-5. EP training wiring (shard_map a2a autodiffs natively; substitute
-   grouped_ffn into moe_forward_ep when multi-host training lands).
+5. ~~EP training wiring~~ — DONE, became §13.11.
 6. ~~A Pallas valid-prefix indexer-scan kernel~~ — DONE, became §13.5.
 7. ~~Exact coarse-to-fine variant~~ — DONE, became §13.7.
 8. ~~mHC half-to-half fusion~~ — DONE, became §13.6.
@@ -812,3 +811,30 @@ the portable default.
 Tests: native ≡ upcast bit-exact through the full MoE path (and the
 tiles default flows), and `tiles_for` resolves `compute_upcast` per
 generation.
+
+### 13.11 Expert-parallel training path (`moe_diff.moe_forward_ep_diff`)
+
+Serving runs MoE expert-parallel: `moe.moe_forward_ep` under `shard_map`
+buckets routed pairs by destination shard, dispatches fp8 payloads over
+an `all_to_all`, runs the per-shard grouped GEMM, and combines back over
+a second a2a. Training had only the *local* diff path
+(`moe_forward_local_diff`); EP training was deferred (the moe_diff
+docstring noted it as "wiring when multi-host lands").
+
+`moe_forward_ep_diff` is that wiring: the same wave/bucket/dispatch
+structure, but (a) it dispatches **bf16** token rows, not fp8 — the a2a
+payload then carries clean gradients (serving's fp8 dispatch is a
+bandwidth choice, an STE optimization unneeded for training correctness),
+and (b) the expert GEMM is the diffable `grouped_ffn` (fp8 forward / bf16
+backward / STE to master weights), as is the shared expert. Everything
+else — `argsort`/scatter bucketing, the two `all_to_all`s, the
+`segment_sum` combine — JAX autodiffs natively: the dispatch a2a's
+backward is a combine-shaped a2a and vice versa, so no hand-written
+glue derivatives. Routing (non-diff top-k) is supplied upstream.
+
+Verified (`test_moe_ep_diff_matches_local_diff`, needs ≥2 devices via
+`--xla_force_host_platform_device_count`): both the forward and the input
+gradient match the local diff path within the bf16-gradient policy, i.e.
+the dispatch/combine round-trip is autodiff-transparent. Substituting it
+into `train_step`'s MoE half is the multi-host enablement; the local path
+stays the single-host default.

@@ -222,3 +222,71 @@ def test_moe_diff_full_gradient_tree():
             assert float(jnp.abs(a).max()) == 0.0
             continue
         assert _rel(a, b) < BF16_POLICY_RTOL, name
+
+
+def test_moe_ep_diff_matches_local_diff():
+    """Training-path EP (HARDWARE_NOTES §13.11): moe_forward_ep_diff under
+    shard_map must match the local diff path in both forward and the input
+    gradient — i.e. the dispatch/combine all_to_all's autodiff transparently
+    (dispatch-bwd is a combine-shaped a2a and vice versa). Needs >=2 devices
+    (XLA_FLAGS=--xla_force_host_platform_device_count=4)."""
+    from functools import partial
+    if jax.device_count() < 2:
+        pytest.skip("needs >=2 devices")
+    ks = jax.random.split(jax.random.PRNGKey(77), 8)
+    M, d, E, dff, topk = 16, 256, 4, 256, 2
+    EP, NW = 2, 2
+    cfg = MoEConfig(n_routed=E, d_expert=dff, topk=topk)
+    tiles = ServingTiles(gemm_tm=16, interpret=True)
+    params = moe_diff.MoEParamsTrain(
+        w_router=jax.random.normal(ks[0], (d, E), jnp.float32) * 0.1,
+        router_bias=jnp.zeros((E,), jnp.float32),
+        w13=jax.random.normal(ks[1], (E, d, 2 * dff), jnp.float32) * 0.05,
+        w2=jax.random.normal(ks[2], (E, dff, d), jnp.float32) * 0.05,
+        w13_shared=jax.random.normal(ks[3], (1, d, 2 * dff), jnp.float32) * 0.05,
+        w2_shared=jax.random.normal(ks[4], (1, dff, d), jnp.float32) * 0.05,
+    )
+    x = jax.random.normal(ks[5], (M, d), jnp.float32) * 0.5
+    cot = jax.random.normal(ks[6], (M, d), jnp.float32)
+    idx, gates = moe_diff.route_train(x, params, cfg)   # shared selection
+
+    def loss_local(x):
+        y = moe_diff.moe_forward_local_diff(x, params, cfg, tiles=tiles,
+                                            idx_gates=(idx, gates))
+        return (y.astype(jnp.float32) * cot).sum()
+    out_local = moe_diff.moe_forward_local_diff(
+        x, params, cfg, tiles=tiles, idx_gates=(idx, gates))
+    dx_local = jax.grad(loss_local)(x)
+
+    mesh = jax.make_mesh((EP,), ("ep",))
+    P = jax.sharding.PartitionSpec
+    NS = lambda s: jax.sharding.NamedSharding(mesh, s)
+    ep_specs = moe_diff.MoEParamsTrain(
+        w_router=P(), router_bias=P(), w13=P("ep"), w2=P("ep"),
+        w13_shared=P(), w2_shared=P())
+    cap = (M // EP) * topk
+    ep_params = jax.tree.map(lambda a, s: jax.device_put(a, NS(s)),
+                             params, ep_specs)
+    xs = jax.device_put(x, NS(P("ep")))
+    idxs = jax.device_put(idx, NS(P("ep")))
+    gs = jax.device_put(gates, NS(P("ep")))
+    cots = jax.device_put(cot, NS(P("ep")))
+
+    def ep_apply(x_, idx_, g_, p_):
+        fn = jax.shard_map(
+            partial(moe_diff.moe_forward_ep_diff, cfg=cfg, axis_name="ep",
+                    ep_size=EP, n_waves=NW, capacity=cap, tiles=tiles),
+            mesh=mesh, in_specs=(P("ep"), P("ep"), P("ep"), ep_specs),
+            out_specs=P("ep"), check_vma=False)
+        return fn(x_, idx_, g_, p_)
+
+    def loss_ep(x_):
+        return (ep_apply(x_, idxs, gs, ep_params).astype(jnp.float32)
+                * cots).sum()
+
+    with jax.set_mesh(mesh):                       # sharded-scalar reduce/grad
+        out_ep = ep_apply(xs, idxs, gs, ep_params)
+        dx_ep = jax.grad(loss_ep)(xs)
+    np.testing.assert_allclose(np.asarray(out_ep), np.asarray(out_local),
+                               rtol=BF16_POLICY_RTOL, atol=2e-2)
+    assert _rel(dx_ep, dx_local) < BF16_POLICY_RTOL
