@@ -366,7 +366,11 @@ def sparse_mqa_gathered(
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary"),
+            # Both grid axes are independent: every (b, t) program reads the
+            # caches read-only and writes its own disjoint [n_h, c] output tile
+            # (decode T=1; prefill T>1). Marking T "parallel" too lets megacore
+            # parts split prefill across both cores instead of leaving one idle.
+            dimension_semantics=("parallel", "parallel"),
         ),
         interpret=tiles.interpret,
     )(idx, pos, q_nope, q_rope, idx, sink2d,

@@ -338,7 +338,9 @@ def sparse_mqa_gathered_blocked(
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary"),
+            # Q-blocks are independent (disjoint per-(b, blk) outputs, caches
+            # read-only) — "parallel" lets megacore split prefill blocks.
+            dimension_semantics=("parallel", "parallel"),
         ),
         interpret=tiles.interpret,
     )(union_b, d, q_nope, q_rope, memb, sink2d,

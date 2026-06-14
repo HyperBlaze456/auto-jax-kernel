@@ -339,7 +339,9 @@ def sparse_mqa_paged(
             pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary"),
+            # T is independent across tokens (disjoint per-(b, t) outputs, caches
+            # read-only) — "parallel" lets megacore split prefill. See attention.py.
+            dimension_semantics=("parallel", "parallel"),
         ),
         interpret=tiles.interpret,
     )(idx, q_pos.astype(jnp.int32), bound.astype(jnp.int32),

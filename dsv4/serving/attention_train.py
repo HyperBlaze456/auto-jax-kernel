@@ -304,7 +304,9 @@ def _fwd_call(q, kc, idx, swa, pos, sink2d, *, n_win, chunk, interpret):
             pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")),
+            # Tokens are independent: disjoint per-(b, t) o/lse outputs, caches
+            # read-only — "parallel" T lets megacore split prefill.
+            dimension_semantics=("parallel", "parallel")),
         interpret=interpret,
     )(idx, pos, q, idx, sink2d, kc, swa)
 
@@ -341,7 +343,11 @@ def _bwd_call(q, kc, idx, swa, pos, lse, D, dout, *, n_win, chunk, interpret):
             pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")),
+            # Each (b, t) program writes its OWN per-token contribution slabs
+            # (dq/dkc/dsw at out index (b, t, ...)); the cross-token dK
+            # reduction happens later in XLA (_segment_reduce_sorted), so there
+            # is no in-kernel accumulation race — T is "parallel".
+            dimension_semantics=("parallel", "parallel")),
         interpret=interpret,
     )(idx, pos, q, idx, lse, D, dout, kc, swa)
 
