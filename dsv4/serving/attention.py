@@ -28,8 +28,13 @@ Layout choices (and the rules forcing them)
   lanes at a non-128 boundary, so the kernel never reconstructs the
   ``c``-wide entry: it runs split dots
   ``logits = q_nope·k_nopeᵀ + q_rope·k_ropeᵀ`` and split PV accumulators,
-  and the wrapper concatenates the two output halves in XLA (free — it
-  fuses into the next op).
+  and the wrapper concatenates the two output halves in XLA. That concat is
+  free *only because* its sole consumer, ``model._grouped_o_proj``, split-
+  contracts the o-projection: it slices ``o`` back at the same 448 seam, which
+  XLA cancels against this concat (``concat→slice`` = identity), so no
+  ``[B,T,n_h,c]`` buffer is materialized. A c-merging reshape in the consumer
+  would instead cross the seam and pin the concat to a real buffer — the trap
+  the split-contraction avoids.
 - **K dequantized to bf16 in VMEM** (``k_q.f32 * row_scale → bf16``).
   This matches the existing bf16 attention baseline's precision (the
   reference itself takes bf16 K) while keeping the MXU on the fast bf16
