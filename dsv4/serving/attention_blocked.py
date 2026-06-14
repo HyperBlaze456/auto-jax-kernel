@@ -64,6 +64,7 @@ def _blocked_mqa_kernel(
     o_rope_ref,        # [1, 1, BQ, n_h, r] bf16
     nope_buf, rope_buf, scale_buf,   # [2, chunk, ...]
     swn_buf, swr_buf, sws_buf,       # [span, ...]
+    accn_buf, accr_buf, l_buf,       # [bq, n_h, ...] f32 per-token accumulators
     gather_sem, swa_sem,
     *,
     k_pad: int,
@@ -117,9 +118,16 @@ def _blocked_mqa_kernel(
 
     q_nope_all = q_nope_ref[0, 0]                         # [BQ, n_h, c_nope]
     q_rope_all = q_rope_ref[0, 0]                         # [BQ, n_h, r]
-    cn = q_nope_all.shape[-1]
-    r = q_rope_all.shape[-1]
-    n_h = q_nope_all.shape[1]
+    n_h, cn = q_nope_all.shape[1], q_nope_all.shape[2]
+    r = q_rope_all.shape[2]
+    M = bq * n_h
+    # All BQ tokens of the block attend the SAME gathered K (shared RHS), so
+    # stack their per-head queries on the M axis and issue ONE [M, c]·[c, chunk]
+    # matmul per chunk instead of BQ at M=n_h. On Flash (n_h=64) this lifts M
+    # 64 -> 512, saturating the 128-row MXU; bit-exact because each output row
+    # is an independent dot over c (stacking M rows changes no single row).
+    q_nope_flat = q_nope_all.reshape(M, cn)
+    q_rope_flat = q_rope_all.reshape(M, r)
 
     def phi_update(st, q_nope, q_rope, k_n, k_r, valid):
         # Decoupled phi-softmax (constant shift C=phi_shift, see attention.py):
@@ -142,11 +150,16 @@ def _blocked_mqa_kernel(
             preferred_element_type=jnp.float32)
         return l_new, acc_n, acc_r
 
-    states = [(jnp.zeros((n_h, 1), jnp.float32),
-               jnp.zeros((n_h, cn), jnp.float32),
-               jnp.zeros((n_h, r), jnp.float32)) for _ in range(bq)]
+    # Per-token accumulators live in scratch (not a python carry) so the
+    # union-chunk MXU can be skipped wholesale under pl.when when the chunk is
+    # beyond the distinct count D. Bit-identical to running phi_update on the
+    # all-masked chunk (every membership entry past D is 0 -> phi=0 -> +0), but
+    # the QK/PV dots never execute. Zero-init is the additive identity.
+    accn_buf[...] = jnp.zeros(accn_buf.shape, jnp.float32)
+    accr_buf[...] = jnp.zeros(accr_buf.shape, jnp.float32)
+    l_buf[...] = jnp.zeros(l_buf.shape, jnp.float32)
 
-    # ---- union chunks, double-buffered, DMA gated by the distinct count ----
+    # ---- union chunks, double-buffered; DMA *and* MXU gated by the count ----
     for j in range(n_chunks):
         slot = j % 2
         base = j * chunk
@@ -156,40 +169,54 @@ def _blocked_mqa_kernel(
                 for c in mk(nb, slot=s):
                     c.start()
 
+        # base < D => the chunk holds >=1 distinct row: wait, dequant, run the
+        # bq QK/PV dots. base >= D => the whole chunk is past the union, so skip
+        # it entirely (its DMA was never started; its contribution would be 0).
         @pl.when(base < D)
-        def _wait(s=slot, bb=base):
+        def _chunk(s=slot, bb=base):
             for c in mk(bb, slot=s):
                 c.wait()
-
-        k_n = (nope_buf[slot].astype(jnp.float32)
-               * scale_buf[slot]).astype(jnp.bfloat16)
-        k_r = rope_buf[slot].astype(jnp.bfloat16)
-        for t in range(bq):
-            valid = (memb_ref[0, 0, t, base:base + chunk] != 0).reshape(1, chunk)
-            states[t] = phi_update(states[t], q_nope_all[t], q_rope_all[t],
-                                     k_n, k_r, valid)
+            k_n = (nope_buf[s].astype(jnp.float32)
+                   * scale_buf[s]).astype(jnp.bfloat16)
+            k_r = rope_buf[s].astype(jnp.bfloat16)
+            # per-token membership [bq, chunk] -> [M, chunk] (shared over heads)
+            memb = (memb_ref[0, 0, :, bb:bb + chunk] != 0)
+            valid = jnp.broadcast_to(memb[:, None, :],
+                                     (bq, n_h, chunk)).reshape(M, chunk)
+            l_new, an, ar = phi_update(
+                (l_buf[...].reshape(M, 1), accn_buf[...].reshape(M, cn),
+                 accr_buf[...].reshape(M, r)),
+                q_nope_flat, q_rope_flat, k_n, k_r, valid)
+            l_buf[...] = l_new.reshape(bq, n_h, 1)
+            accn_buf[...] = an.reshape(bq, n_h, cn)
+            accr_buf[...] = ar.reshape(bq, n_h, r)
 
     # ---- SWA span chunk (shared slab, per-token positional mask) ----
     for c in swa_copies():
         c.wait()
     k_n = (swn_buf[...].astype(jnp.float32) * sws_buf[...]).astype(jnp.bfloat16)
     k_r = swr_buf[...].astype(jnp.bfloat16)
-    span_iota = jax.lax.broadcasted_iota(jnp.int32, (1, span), 1)
-    for t in range(bq):
-        p_t = p0 + t
-        w_pos = span_start + span_iota
-        valid = jnp.logical_and(jnp.logical_and(w_pos <= p_t, w_pos > p_t - n_win),
-                                w_pos >= 0)
-        states[t] = phi_update(states[t], q_nope_all[t], q_rope_all[t],
-                                 k_n, k_r, valid)
+    span_iota = jax.lax.broadcasted_iota(jnp.int32, (1, span), 1)   # [1, span]
+    p_t = p0 + jax.lax.broadcasted_iota(jnp.int32, (bq, 1), 0)      # [bq, 1] token pos
+    w_pos = span_start + span_iota                                  # [1, span]
+    memb = jnp.logical_and(jnp.logical_and(w_pos <= p_t, w_pos > p_t - n_win),
+                           w_pos >= 0)                              # [bq, span]
+    valid = jnp.broadcast_to(memb[:, None, :], (bq, n_h, span)).reshape(M, span)
+    l_new, an, ar = phi_update(
+        (l_buf[...].reshape(M, 1), accn_buf[...].reshape(M, cn),
+         accr_buf[...].reshape(M, r)),
+        q_nope_flat, q_rope_flat, k_n, k_r, valid)
+    l_buf[...] = l_new.reshape(bq, n_h, 1)
+    accn_buf[...] = an.reshape(bq, n_h, cn)
+    accr_buf[...] = ar.reshape(bq, n_h, r)
 
     # ---- finalize each token with the per-head sink ----
-    sink = sink_ref[...]
+    # exp(sink - C) is grid-invariant; compute it once, not bq times.
+    sink_term = jnp.exp(sink_ref[...] - jnp.float32(phi_shift))   # [n_h, 1]
     for t in range(bq):
-        l_i, acc_n, acc_r = states[t]
-        denom = l_i + jnp.exp(sink - jnp.float32(phi_shift))
-        o_nope_ref[0, 0, t] = (acc_n / denom).astype(o_nope_ref.dtype)
-        o_rope_ref[0, 0, t] = (acc_r / denom).astype(o_rope_ref.dtype)
+        denom = l_buf[t] + sink_term
+        o_nope_ref[0, 0, t] = (accn_buf[t] / denom).astype(o_nope_ref.dtype)
+        o_rope_ref[0, 0, t] = (accr_buf[t] / denom).astype(o_rope_ref.dtype)
 
 
 def _build_union(topk_idxs, bq, k_union):
@@ -304,6 +331,9 @@ def sparse_mqa_gathered_blocked(
             pltpu.VMEM((span, c_nope), swa.nope.dtype),
             pltpu.VMEM((span, rope_dim), jnp.bfloat16),
             pltpu.VMEM((span, 1), jnp.float32),
+            pltpu.VMEM((bq, n_h, c_nope), jnp.float32),    # accn_buf
+            pltpu.VMEM((bq, n_h, rope_dim), jnp.float32),  # accr_buf
+            pltpu.VMEM((bq, n_h, 1), jnp.float32),         # l_buf
             pltpu.SemaphoreType.DMA,
             pltpu.SemaphoreType.DMA,
         ],
