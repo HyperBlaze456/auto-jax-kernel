@@ -69,8 +69,25 @@ overlap (not bandwidth) is the binding constraint, hence the wave scheme.
   kernel runs split QK dots and split PV accumulators; the wrapper
   concatenates outputs in XLA.
 - K rows dequantize to bf16 *in VMEM* (`fp8 · row_scale → bf16`) —
-  precision identical to the bf16 reference baseline; flash state (m, l,
+  precision identical to the bf16 reference baseline; softmax state (l,
   acc) is fp32; sink handled as in kernel_v1.
+- **Decoupled φ-softmax, not online-softmax** (decode/prefill path only;
+  paged/blocked/train kernels still run online). Because q and cached k are
+  RMSNormed (`eager.rms_norm`, no learned gain) and RoPE preserves norm,
+  every logit obeys `|scale·q·kᵀ| ≤ scale·‖q‖‖k‖ = √c` (Cauchy-Schwarz) —
+  √128≈11.3 (Flash dev), √512≈22.6 (Pro), so `exp(logit−√c)` cannot
+  overflow fp32 (worst case `e^22.6≈7e9` ≪ 3.4e38). A *constant* shift
+  `C=√c` replaces the running max: `φ=exp(logit−C)≤1`, numerator/denominator
+  are **pure accumulators** — the per-step `acc·alpha` read-scale-write and
+  the `max→alpha→acc` cross-step serial chain are gone, PV dots accumulate
+  straight on the MXU. The shift cancels exactly in the final normalize
+  (true lse `= C + log(denom)`, recoverable). Verified (`phi_verify.py`,
+  `phi_twin.py`): φ-math equals the fp32 softmax oracle to ~5e-7; in the
+  kernel's bf16 arithmetic φ is 1.34× the online abs-error (8.5e-3 vs
+  6.3e-3 worst, both ~2× the bf16 *output* rounding floor) — online pins the
+  top weight to exactly 1.0, which a fixed C can't, so dropping the running
+  max costs ~1 bf16 ULP on peaked rows. fp32 PV weights recover online
+  precision exactly (1.00×) if ever needed; bf16 PV kept here for MXU rate.
 - SWA branch = one contiguous DMA per component + absolute-position
   masking (fixes the reference's zero-pad pseudo-key quirk).
 
