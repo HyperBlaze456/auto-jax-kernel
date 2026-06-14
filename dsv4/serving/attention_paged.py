@@ -57,9 +57,6 @@ import jax.numpy as jnp
 from .config import ServingTiles
 from .quant import KVQuant
 
-_NEG_INF = -1.0e30
-
-
 # ---------------------------------------------------------------------------
 # Page-aligned selection
 # ---------------------------------------------------------------------------
@@ -156,7 +153,7 @@ def _paged_mqa_kernel(
     gather_sem, swa_sem,
     *,
     kp_pad: int, pages: int, page: int, n_win: int, s_raw: int, scale: float,
-    swa_ring: bool,
+    phi_shift: float, swa_ring: bool,
 ):
     b = pl.program_id(0)
     n_chunks = kp_pad // pages
@@ -189,31 +186,29 @@ def _paged_mqa_kernel(
     q_nope = q_nope_ref[0, 0].astype(jnp.bfloat16)
     q_rope = q_rope_ref[0, 0].astype(jnp.bfloat16)
     n_h = q_nope.shape[0]
-    m_i = jnp.full((n_h, 1), _NEG_INF, jnp.float32)
     l_i = jnp.zeros((n_h, 1), jnp.float32)
     acc_n = jnp.zeros(o_nope_ref.shape[2:], jnp.float32)
     acc_r = jnp.zeros(o_rope_ref.shape[2:], jnp.float32)
 
-    def flash_update(m_i, l_i, acc_n, acc_r, k_n, k_r, valid):
+    def phi_update(l_i, acc_n, acc_r, k_n, k_r, valid):
+        # Decoupled phi-softmax: constant shift C=phi_shift (=sqrt(c)) for the
+        # running max — see attention.py. Pure accumulators, no acc*alpha.
         logits = (
             jax.lax.dot_general(q_nope, k_n, (((1,), (1,)), ((), ())),
                                 preferred_element_type=jnp.float32)
             + jax.lax.dot_general(q_rope, k_r, (((1,), (1,)), ((), ())),
                                   preferred_element_type=jnp.float32)
         ) * jnp.float32(scale)
-        logits = jnp.where(valid, logits, jnp.float32(_NEG_INF))
-        m_new = jnp.maximum(m_i, jnp.max(logits, -1, keepdims=True))
-        p = jnp.where(valid, jnp.exp(logits - m_new), 0.0)
-        alpha = jnp.exp(m_i - m_new)
-        l_new = alpha * l_i + p.sum(-1, keepdims=True)
-        p_bf = p.astype(jnp.bfloat16)
-        acc_n = acc_n * alpha + jax.lax.dot_general(
-            p_bf, k_n, (((1,), (0,)), ((), ())),
+        phi = jnp.where(valid, jnp.exp(logits - jnp.float32(phi_shift)), 0.0)
+        l_new = l_i + phi.sum(-1, keepdims=True)
+        phi_bf = phi.astype(jnp.bfloat16)
+        acc_n = acc_n + jax.lax.dot_general(
+            phi_bf, k_n, (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32)
-        acc_r = acc_r * alpha + jax.lax.dot_general(
-            p_bf, k_r, (((1,), (0,)), ((), ())),
+        acc_r = acc_r + jax.lax.dot_general(
+            phi_bf, k_r, (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32)
-        return m_new, l_new, acc_n, acc_r
+        return l_new, acc_n, acc_r
 
     for j in range(n_chunks):
         slot = j % 2
@@ -231,8 +226,7 @@ def _paged_mqa_kernel(
         within = jax.lax.broadcasted_iota(jnp.int32, (pages, page), 1)
         gl_rows = pg[:, None] * page + within                 # [pages, P]
         valid = ((pg[:, None] >= 0) & (gl_rows < bound)).reshape(1, rows)
-        m_i, l_i, acc_n, acc_r = flash_update(m_i, l_i, acc_n, acc_r,
-                                              k_n, k_r, valid)
+        l_i, acc_n, acc_r = phi_update(l_i, acc_n, acc_r, k_n, k_r, valid)
 
     for c in swa_copies():
         c.wait()
@@ -245,14 +239,12 @@ def _paged_mqa_kernel(
     else:
         w_pos = start + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1)
         valid = jnp.logical_and(w_pos <= pos, w_pos > pos - n_win)
-    m_i, l_i, acc_n, acc_r = flash_update(m_i, l_i, acc_n, acc_r, k_n, k_r, valid)
+    l_i, acc_n, acc_r = phi_update(l_i, acc_n, acc_r, k_n, k_r, valid)
 
     sink = sink_ref[...]
-    m_comb = jnp.maximum(m_i, sink)
-    alpha = jnp.exp(m_i - m_comb)
-    denom = l_i * alpha + jnp.exp(sink - m_comb)
-    o_nope_ref[0, 0] = ((acc_n * alpha) / denom).astype(o_nope_ref.dtype)
-    o_rope_ref[0, 0] = ((acc_r * alpha) / denom).astype(o_rope_ref.dtype)
+    denom = l_i + jnp.exp(sink - jnp.float32(phi_shift))
+    o_nope_ref[0, 0] = (acc_n / denom).astype(o_nope_ref.dtype)
+    o_rope_ref[0, 0] = (acc_r / denom).astype(o_rope_ref.dtype)
 
 
 def sparse_mqa_paged(
@@ -308,7 +300,7 @@ def sparse_mqa_paged(
     o_nope, o_rope = pl.pallas_call(
         partial(_paged_mqa_kernel, kp_pad=kp_pad, pages=pages, page=page,
                 n_win=n_win, s_raw=s_raw, scale=float(c) ** -0.5,
-                swa_ring=swa_ring),
+                phi_shift=float(c) ** 0.5, swa_ring=swa_ring),
         grid=(B, T),
         in_specs=[
             pl.BlockSpec((1, 1, kp_pad), lambda b, t: (b, t, 0),

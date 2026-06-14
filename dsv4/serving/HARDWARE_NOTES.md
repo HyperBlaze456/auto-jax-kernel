@@ -71,8 +71,9 @@ overlap (not bandwidth) is the binding constraint, hence the wave scheme.
 - K rows dequantize to bf16 *in VMEM* (`fp8 · row_scale → bf16`) —
   precision identical to the bf16 reference baseline; softmax state (l,
   acc) is fp32; sink handled as in kernel_v1.
-- **Decoupled φ-softmax, not online-softmax** (decode/prefill path only;
-  paged/blocked/train kernels still run online). Because q and cached k are
+- **Decoupled φ-softmax, not online-softmax** (all gather-attention kernels:
+  row decode/prefill, paged, blocked q-batch, and the train forward; the train
+  backward is unchanged — it recomputes from `lse` only). Because q and cached k are
   RMSNormed (`eager.rms_norm`, no learned gain) and RoPE preserves norm,
   every logit obeys `|scale·q·kᵀ| ≤ scale·‖q‖‖k‖ = √c` (Cauchy-Schwarz) —
   √128≈11.3 (Flash dev), √512≈22.6 (Pro), so `exp(logit−√c)` cannot

@@ -46,7 +46,7 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
-from .attention import _NEG_INF, _gather_chunk_copies
+from .attention import _gather_chunk_copies
 from .config import ServingTiles
 from .quant import KVQuant
 
@@ -72,6 +72,7 @@ def _blocked_mqa_kernel(
     span: int,
     s_raw: int,
     scale: float,
+    phi_shift: float,
     bq: int,
 ):
     b = pl.program_id(0)
@@ -120,31 +121,28 @@ def _blocked_mqa_kernel(
     r = q_rope_all.shape[-1]
     n_h = q_nope_all.shape[1]
 
-    def flash_update(st, q_nope, q_rope, k_n, k_r, valid):
-        m_i, l_i, acc_n, acc_r = st
+    def phi_update(st, q_nope, q_rope, k_n, k_r, valid):
+        # Decoupled phi-softmax (constant shift C=phi_shift, see attention.py):
+        # pure accumulators, no running max / acc*alpha rescale.
+        l_i, acc_n, acc_r = st
         logits = (
             jax.lax.dot_general(q_nope, k_n, (((1,), (1,)), ((), ())),
                                 preferred_element_type=jnp.float32)
             + jax.lax.dot_general(q_rope, k_r, (((1,), (1,)), ((), ())),
                                   preferred_element_type=jnp.float32)
         ) * jnp.float32(scale)
-        logits = jnp.where(valid, logits, jnp.float32(_NEG_INF))
-        m_new = jnp.maximum(m_i, jnp.max(logits, axis=-1, keepdims=True))
-        p = jnp.exp(logits - m_new)
-        p = jnp.where(valid, p, 0.0)
-        alpha = jnp.exp(m_i - m_new)
-        l_new = alpha * l_i + jnp.sum(p, axis=-1, keepdims=True)
-        p_bf = p.astype(jnp.bfloat16)
-        acc_n = acc_n * alpha + jax.lax.dot_general(
-            p_bf, k_n, (((1,), (0,)), ((), ())),
+        phi = jnp.where(valid, jnp.exp(logits - jnp.float32(phi_shift)), 0.0)
+        l_new = l_i + jnp.sum(phi, axis=-1, keepdims=True)
+        phi_bf = phi.astype(jnp.bfloat16)
+        acc_n = acc_n + jax.lax.dot_general(
+            phi_bf, k_n, (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32)
-        acc_r = acc_r * alpha + jax.lax.dot_general(
-            p_bf, k_r, (((1,), (0,)), ((), ())),
+        acc_r = acc_r + jax.lax.dot_general(
+            phi_bf, k_r, (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32)
-        return m_new, l_new, acc_n, acc_r
+        return l_new, acc_n, acc_r
 
-    states = [(jnp.full((n_h, 1), _NEG_INF, jnp.float32),
-               jnp.zeros((n_h, 1), jnp.float32),
+    states = [(jnp.zeros((n_h, 1), jnp.float32),
                jnp.zeros((n_h, cn), jnp.float32),
                jnp.zeros((n_h, r), jnp.float32)) for _ in range(bq)]
 
@@ -168,7 +166,7 @@ def _blocked_mqa_kernel(
         k_r = rope_buf[slot].astype(jnp.bfloat16)
         for t in range(bq):
             valid = (memb_ref[0, 0, t, base:base + chunk] != 0).reshape(1, chunk)
-            states[t] = flash_update(states[t], q_nope_all[t], q_rope_all[t],
+            states[t] = phi_update(states[t], q_nope_all[t], q_rope_all[t],
                                      k_n, k_r, valid)
 
     # ---- SWA span chunk (shared slab, per-token positional mask) ----
@@ -182,18 +180,16 @@ def _blocked_mqa_kernel(
         w_pos = span_start + span_iota
         valid = jnp.logical_and(jnp.logical_and(w_pos <= p_t, w_pos > p_t - n_win),
                                 w_pos >= 0)
-        states[t] = flash_update(states[t], q_nope_all[t], q_rope_all[t],
+        states[t] = phi_update(states[t], q_nope_all[t], q_rope_all[t],
                                  k_n, k_r, valid)
 
     # ---- finalize each token with the per-head sink ----
     sink = sink_ref[...]
     for t in range(bq):
-        m_i, l_i, acc_n, acc_r = states[t]
-        m_comb = jnp.maximum(m_i, sink)
-        alpha = jnp.exp(m_i - m_comb)
-        denom = l_i * alpha + jnp.exp(sink - m_comb)
-        o_nope_ref[0, 0, t] = ((acc_n * alpha) / denom).astype(o_nope_ref.dtype)
-        o_rope_ref[0, 0, t] = ((acc_r * alpha) / denom).astype(o_rope_ref.dtype)
+        l_i, acc_n, acc_r = states[t]
+        denom = l_i + jnp.exp(sink - jnp.float32(phi_shift))
+        o_nope_ref[0, 0, t] = (acc_n / denom).astype(o_nope_ref.dtype)
+        o_rope_ref[0, 0, t] = (acc_r / denom).astype(o_rope_ref.dtype)
 
 
 def _build_union(topk_idxs, bq, k_union):
@@ -274,7 +270,8 @@ def sparse_mqa_gathered_blocked(
 
     o_nope, o_rope = pl.pallas_call(
         partial(_blocked_mqa_kernel, k_pad=k_union, chunk=chunk, n_win=n_win,
-                span=span, s_raw=s_raw, scale=float(c) ** -0.5, bq=bq),
+                span=span, s_raw=s_raw, scale=float(c) ** -0.5,
+                phi_shift=float(c) ** 0.5, bq=bq),
         grid=(B, nb),
         in_specs=[
             pl.BlockSpec((1, 1, k_union), lambda b, t: (b, t, 0),
