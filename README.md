@@ -58,16 +58,9 @@ uv run python bench.py --sweep
 `fwd_mfu_percent`, `max_abs_diff` vs reference, `status`. The agent greps
 this to record results.
 
-## Running the agent
+## To the agent:
 
-Spin up Claude/Codex in this repo (with permissions disabled), then:
-
-```
-Hi have a look at program.md and let's kick off a new kernel-dev experiment.
-let's do the setup first.
-```
-
-`program.md` is the agent's working spec — what it can/can't touch, what
+`program.md` is the working spec — what it can/can't touch, what
 counts as a win, how to log results.
 
 ## Profiling
@@ -83,13 +76,6 @@ XLA_FLAGS="--xla_dump_to=/tmp/hlo --xla_dump_hlo_as_text" \
 ```
 
 Use `jax.named_scope("...")` in your kernel code to make the trace legible.
-
-## Upstream
-
-Branched from [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
-The original GPT-training driver (`prepare.py`, `train.py`, `analysis.ipynb`,
-`progress.png`) is left in the tree for reference but is not used by this
-kernel work.
 
 ## License
 

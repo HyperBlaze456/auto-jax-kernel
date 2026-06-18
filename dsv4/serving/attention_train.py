@@ -57,8 +57,6 @@ import numpy as np
 
 from .config import ServingTiles
 
-_NEG_INF = -1.0e30
-
 
 def _segment_reduce_sorted(dest, contrib, n_dest):
     """Deterministic dK reduction by sort-by-destination + segment-sum.
@@ -125,6 +123,7 @@ def _fwd_kernel(
     gsem, ssem,
     *,
     k_pad: int, chunk: int, n_win: int, s_raw: int, scale: float,
+    phi_shift: float,
 ):
     b = pl.program_id(0)
     n_chunks = k_pad // chunk
@@ -137,23 +136,22 @@ def _fwd_kernel(
 
     q = q_ref[0, 0].astype(jnp.bfloat16)                   # [n_h, c]
     n_h = q.shape[0]
-    m_i = jnp.full((n_h, 1), _NEG_INF, jnp.float32)
     l_i = jnp.zeros((n_h, 1), jnp.float32)
     acc = jnp.zeros(q.shape, jnp.float32)
 
-    def update(m_i, l_i, acc, k_rows, valid):
+    def update(l_i, acc, k_rows, valid):
+        # Decoupled phi-softmax (constant shift C=phi_shift). lse emitted below
+        # is exactly C + log(denom) = true sink-inclusive log-sum-exp, so the
+        # backward (which recomputes p = exp(logit − lse)) is unchanged.
         logits = jax.lax.dot_general(
             q, k_rows, (((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32) * jnp.float32(scale)
-        logits = jnp.where(valid, logits, jnp.float32(_NEG_INF))
-        m_new = jnp.maximum(m_i, jnp.max(logits, -1, keepdims=True))
-        p = jnp.where(valid, jnp.exp(logits - m_new), 0.0)
-        alpha = jnp.exp(m_i - m_new)
-        l_new = alpha * l_i + p.sum(-1, keepdims=True)
-        acc = acc * alpha + jax.lax.dot_general(
-            p.astype(jnp.bfloat16), k_rows, (((1,), (0,)), ((), ())),
+        phi = jnp.where(valid, jnp.exp(logits - jnp.float32(phi_shift)), 0.0)
+        l_new = l_i + phi.sum(-1, keepdims=True)
+        acc = acc + jax.lax.dot_general(
+            phi.astype(jnp.bfloat16), k_rows, (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32)
-        return m_new, l_new, acc
+        return l_new, acc
 
     for j in range(n_chunks):
         slot = j % 2
@@ -166,20 +164,17 @@ def _fwd_kernel(
             cp.wait()
         idx_vec = idx_vmem_ref[0, 0, j * chunk:(j + 1) * chunk]
         valid = (idx_vec >= 0).reshape(1, chunk)
-        m_i, l_i, acc = update(m_i, l_i, acc,
-                               kbuf[slot].astype(jnp.bfloat16), valid)
+        l_i, acc = update(l_i, acc, kbuf[slot].astype(jnp.bfloat16), valid)
 
     _swa_copy(sw_hbm, swbuf, ssem, b, start, n_win).wait()
     w_pos = start + jax.lax.broadcasted_iota(jnp.int32, (1, n_win), 1)
     valid = jnp.logical_and(w_pos <= pos, w_pos > pos - n_win)
-    m_i, l_i, acc = update(m_i, l_i, acc, swbuf[...].astype(jnp.bfloat16), valid)
+    l_i, acc = update(l_i, acc, swbuf[...].astype(jnp.bfloat16), valid)
 
     sink = sink_ref[...]
-    m_comb = jnp.maximum(m_i, sink)
-    alpha = jnp.exp(m_i - m_comb)
-    denom = l_i * alpha + jnp.exp(sink - m_comb)
-    o_ref[0, 0] = ((acc * alpha) / denom).astype(o_ref.dtype)
-    lse_ref[0, 0] = (m_comb + jnp.log(denom)).astype(jnp.float32)
+    denom = l_i + jnp.exp(sink - jnp.float32(phi_shift))
+    o_ref[0, 0] = (acc / denom).astype(o_ref.dtype)
+    lse_ref[0, 0] = (jnp.float32(phi_shift) + jnp.log(denom)).astype(jnp.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +283,7 @@ def _fwd_call(q, kc, idx, swa, pos, sink2d, *, n_win, chunk, interpret):
     scale = float(c) ** -0.5
     return pl.pallas_call(
         partial(_fwd_kernel, k_pad=k_pad, chunk=chunk, n_win=n_win,
-                s_raw=s_raw, scale=scale),
+                s_raw=s_raw, scale=scale, phi_shift=float(c) ** 0.5),
         grid=(B, T),
         in_specs=_common_in_specs(k_pad, n_h, c) + [
             pl.BlockSpec((n_h, 1), lambda b, t: (0, 0)),
@@ -309,7 +304,9 @@ def _fwd_call(q, kc, idx, swa, pos, sink2d, *, n_win, chunk, interpret):
             pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")),
+            # Tokens are independent: disjoint per-(b, t) o/lse outputs, caches
+            # read-only — "parallel" T lets megacore split prefill.
+            dimension_semantics=("parallel", "parallel")),
         interpret=interpret,
     )(idx, pos, q, idx, sink2d, kc, swa)
 
@@ -346,7 +343,11 @@ def _bwd_call(q, kc, idx, swa, pos, lse, D, dout, *, n_win, chunk, interpret):
             pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA,
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")),
+            # Each (b, t) program writes its OWN per-token contribution slabs
+            # (dq/dkc/dsw at out index (b, t, ...)); the cross-token dK
+            # reduction happens later in XLA (_segment_reduce_sorted), so there
+            # is no in-kernel accumulation race — T is "parallel".
+            dimension_semantics=("parallel", "parallel")),
         interpret=interpret,
     )(idx, pos, q, idx, lse, D, dout, kc, swa)
 
