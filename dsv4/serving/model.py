@@ -316,11 +316,31 @@ def _swa_rows(h, p, rope_dim, positions):
     return eager.rms_norm(k)
 
 
-def _grouped_o_proj(o, w_o1, w_o2, g):
+def _grouped_o_proj(o, w_o1, w_o2, g, rope_dim):
+    """Grouped output projection (paper §2.3.1), split at the nope/rope seam.
+
+    The attention kernels emit ``o`` as ``concat([o_nope, o_rope])`` along the
+    c axis. Slicing it back here at ``c_nope`` lets XLA cancel that lane-concat
+    (``concat→slice`` is the identity) against the kernel's split outputs, so
+    the ``[B, T, n_h, c]`` tensor is never materialized. The previous c-merging
+    reshape (``[n_h, c] → [g, (n_h/g)·c]``) instead crossed the seam, pinning
+    the concat to a real bf16 buffer (n_h·c·2 B/tok/layer). The two half-
+    contractions accumulate in fp32 and sum to a single bf16 round — same
+    precision as the one-einsum form up to fp32 reassociation."""
     B, T, n_h, c = o.shape
-    og = o.reshape(B, T, g, (n_h // g) * c)
-    inter = jnp.einsum("btgk,gkj->btgj", og, w_o1.astype(o.dtype))
-    return inter.reshape(B, T, -1) @ w_o2.astype(o.dtype)
+    c_nope = c - rope_dim
+    gh, d_g = n_h // g, w_o1.shape[-1]
+    dt = o.dtype
+    w = w_o1.reshape(g, gh, c, d_g)                       # per-head c-block of K
+    on = o[..., :c_nope].reshape(B, T, g, gh, c_nope)
+    orr = o[..., c_nope:].reshape(B, T, g, gh, rope_dim)
+    inter = (
+        jnp.einsum("btghk,ghkj->btgj", on, w[:, :, :c_nope, :].astype(dt),
+                   preferred_element_type=jnp.float32)
+        + jnp.einsum("btghk,ghkj->btgj", orr, w[:, :, c_nope:, :].astype(dt),
+                     preferred_element_type=jnp.float32)
+    ).astype(dt)
+    return inter.reshape(B, T, -1) @ w_o2.astype(dt)
 
 
 def _csa_entry_from_blocks(h2m, p, m, rope_dim, blk_pos):
@@ -598,7 +618,7 @@ def _attn_prefill(h, lp: LayerParams, cfg: ModelConfig, cache: LayerCache,
         o = sparse_mqa_gathered(q, cache.kc, topk, swa_kern, positions,
                                 p.attn_sink, n_win=acfg.n_win, rope_dim=rd,
                                 tiles=tiles)
-    return _grouped_o_proj(o, lp.w_o1, lp.w_o2, cfg.g), cache
+    return _grouped_o_proj(o, lp.w_o1, lp.w_o2, cfg.g, rd), cache
 
 
 def _attn_decode(h_t, pos, lp: LayerParams, cfg: ModelConfig,
@@ -740,7 +760,7 @@ def _attn_decode(h_t, pos, lp: LayerParams, cfg: ModelConfig,
         o = sparse_mqa_gathered(q, cache.kc, topk, cache.swa, positions,
                                 p.attn_sink, n_win=acfg.n_win, rope_dim=rd,
                                 swa_ring=True, tiles=tiles)
-    return _grouped_o_proj(o, lp.w_o1, lp.w_o2, cfg.g), cache
+    return _grouped_o_proj(o, lp.w_o1, lp.w_o2, cfg.g, rd), cache
 
 
 def _moe_sublayer(h, token_ids, layer_idx, lp: LayerParams, cfg: ModelConfig,

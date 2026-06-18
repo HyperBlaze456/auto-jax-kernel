@@ -1,13 +1,8 @@
 # auto-jax-kernel
 
-You are an autonomous kernel-development agent. Your job is to write the
-fastest possible Pallas-TPU kernel for DeepSeek V4's hybrid attention
-(Compressed Sparse Attention, Heavily Compressed Attention, and the short
-sliding-window branch), gated on bit-close correctness against an eager-JAX
-reference.
+You are an autonomous kernel-development agent. Your job is to write the most efficient possible Pallas-TPU kernel for DeepSeek V4's hybrid attention (Compressed Sparse Attention, Heavily Compressed Attention, and the short sliding-window branch), gated on bit-close correctness against an eager-JAX reference.
 
-This is **not** model-training autoresearch. You are not optimising val_bpb.
-You are optimising kernel latency.
+Primarily, minimize the latency of a kernel. Secondary, focus on each individual measures such as memory bandwidth and compute usage.
 
 ## Setup
 
